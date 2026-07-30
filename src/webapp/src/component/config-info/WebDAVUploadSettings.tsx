@@ -4,6 +4,23 @@ import { CloudUploadOutlined } from '@ant-design/icons';
 
 const { TextArea, Password } = Input;
 
+const validateWebDAVURL = (_: unknown, value?: string) => {
+  if (!value) {
+    return Promise.resolve();
+  }
+
+  try {
+    const parsedURL = new URL(value);
+    if ((parsedURL.protocol === 'http:' || parsedURL.protocol === 'https:') && parsedURL.hostname) {
+      return Promise.resolve();
+    }
+  } catch {
+    // 交由下方统一返回表单错误。
+  }
+
+  return Promise.reject(new Error('请输入有效的 HTTP(S) 地址'));
+};
+
 interface ConfigFieldProps {
   label: string;
   description?: string;
@@ -58,7 +75,7 @@ const WebDAVUploadSettings: React.FC<WebDAVUploadSettingsProps> = ({ config }) =
       >
         <Form.Item
           name={['on_record_finished', 'webdav_upload', 'url']}
-          rules={[{ type: 'url', message: '请输入有效的 HTTP(S) 地址' }]}
+          rules={[{ validator: validateWebDAVURL }]}
           noStyle
         >
           <Input placeholder="https://dav.example.com/dav/" style={{ width: 520 }} />
