@@ -42,6 +42,12 @@ func TestConfig_Verify(t *testing.T) {
 	cfg.OutPutPath = "foobar"
 	assert.Error(t, cfg.Verify())
 	cfg.OutPutPath = os.TempDir()
+	cfg.RPC.Enable = true
+	cfg.OnRecordFinished.WebDAVUpload.Enable = true
+	cfg.OnRecordFinished.WebDAVUpload.URL = "ftp://example.com/dav"
+	assert.Error(t, cfg.Verify())
+	cfg.OnRecordFinished.WebDAVUpload.URL = "https://example.com/dav"
+	assert.NoError(t, cfg.Verify())
 	cfg.RPC.Enable = false
 	assert.Error(t, cfg.Verify())
 }

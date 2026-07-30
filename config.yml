@@ -45,6 +45,18 @@ on_record_finished:
     storage_name: ""
     upload_path_tmpl: /录播归档/{{ .Platform }}/{{ .HostName }}/{{ .RoomName }}-{{ now | date "2006-01-02" }}.{{ .Ext }}
     delete_after_upload: false
+  webdav_upload:
+    enable: false
+    # WebDAV 根地址，例如:
+    # https://dav.example.com/remote.php/dav/files/username
+    url: ""
+    username: ""
+    password: ""
+    # WebDAV 远程文件路径模板
+    # 支持 Platform、HostName、RoomName、FileName、Ext 和 now/date
+    remote_path_tmpl: /录播归档/{{ .Platform }}/{{ .HostName }}/{{ .FileName }}
+    # 仅在 WebDAV 服务端确认上传成功后删除本地文件
+    delete_after_upload: false
   upload_timing: after_process
 timeout_in_us: 60000000
 live_rooms:

@@ -32,3 +32,29 @@ func TestGetSoopLiveAuthConfigDoesNotExposeSavedPassword(t *testing.T) {
 	_, exists := data["password"]
 	assert.False(t, exists)
 }
+
+func TestApplyConfigUpdatesWebDAVUpload(t *testing.T) {
+	cfg := configs.NewConfig()
+	err := applyConfigUpdates(cfg, map[string]interface{}{
+		"on_record_finished": map[string]interface{}{
+			"webdav_upload": map[string]interface{}{
+				"enable":              true,
+				"url":                 " https://dav.example.com/root/ ",
+				"username":            "alice",
+				"password":            "secret",
+				"remote_path_tmpl":    "/archive/{{ .FileName }}",
+				"delete_after_upload": true,
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, configs.WebDAVUpload{
+		Enable:            true,
+		URL:               "https://dav.example.com/root/",
+		Username:          "alice",
+		Password:          "secret",
+		RemotePathTmpl:    "/archive/{{ .FileName }}",
+		DeleteAfterUpload: true,
+	}, cfg.OnRecordFinished.WebDAVUpload)
+}

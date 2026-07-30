@@ -356,6 +356,16 @@ type CloudUpload struct {
 	AdditionalStorages []string `yaml:"additional_storages,omitempty" json:"additional_storages,omitempty"` // 额外存储（支持多目标上传）
 }
 
+// WebDAVUpload 录制完成后的 WebDAV 上传配置。
+type WebDAVUpload struct {
+	Enable            bool   `yaml:"enable" json:"enable"`                           // 是否启用 WebDAV 上传
+	URL               string `yaml:"url" json:"url"`                                 // WebDAV 根地址
+	Username          string `yaml:"username" json:"username"`                       // Basic Auth 用户名
+	Password          string `yaml:"password" json:"password"`                       // Basic Auth 密码
+	RemotePathTmpl    string `yaml:"remote_path_tmpl" json:"remote_path_tmpl"`       // 远程路径模板
+	DeleteAfterUpload bool   `yaml:"delete_after_upload" json:"delete_after_upload"` // 上传成功后删除本地文件
+}
+
 // On record finished actions.
 type OnRecordFinished struct {
 	ConvertToMp4          bool         `yaml:"convert_to_mp4" json:"convert_to_mp4"`
@@ -364,6 +374,7 @@ type OnRecordFinished struct {
 	FixFlvAtFirst         bool         `yaml:"fix_flv_at_first" json:"fix_flv_at_first"`
 	SaveCover             bool         `yaml:"save_cover" json:"save_cover"`       // 保存视频第一帧作为封面图（.jpg）
 	CloudUpload           CloudUpload  `yaml:"cloud_upload" json:"cloud_upload"`   // 云上传配置
+	WebDAVUpload          WebDAVUpload `yaml:"webdav_upload" json:"webdav_upload"` // WebDAV 上传配置
 	UploadTiming          UploadTiming `yaml:"upload_timing" json:"upload_timing"` // 上传时机
 	BurnSubtitles         bool         `yaml:"burn_subtitles" json:"burn_subtitles"`                         // 烧录弹幕字幕到视频（硬编码）
 	BurnSubtitlesCodec    string       `yaml:"burn_subtitles_codec" json:"burn_subtitles_codec"`             // 烧录用视频编码器，默认 libx264
@@ -977,6 +988,14 @@ var defaultConfig = Config{
 			UploadPathTmpl:    "/录播归档/{{ .Platform }}/{{ .HostName }}/{{ .RoomName }}-{{ now | date \"2006-01-02\" }}.{{ .Ext }}",
 			DeleteAfterUpload: false,
 		},
+		WebDAVUpload: WebDAVUpload{
+			Enable:            false,
+			URL:               "",
+			Username:          "",
+			Password:          "",
+			RemotePathTmpl:    "/录播归档/{{ .Platform }}/{{ .HostName }}/{{ .FileName }}",
+			DeleteAfterUpload: false,
+		},
 		UploadTiming:        UploadTimingAfterProcess,
 		BurnSubtitles:       false,
 		BurnSubtitlesCodec:  "libx264",
@@ -1099,6 +1118,12 @@ func (c *Config) Verify() error {
 	}
 	if !c.RPC.Enable && len(c.LiveRooms) == 0 {
 		return fmt.Errorf("RPC 服务已禁用且未配置直播间，程序无任务可执行")
+	}
+	if c.OnRecordFinished.WebDAVUpload.Enable {
+		webdavURL, err := url.Parse(c.OnRecordFinished.WebDAVUpload.URL)
+		if err != nil || webdavURL.Host == "" || (webdavURL.Scheme != "http" && webdavURL.Scheme != "https") {
+			return fmt.Errorf("WebDAV 地址必须是有效的 HTTP(S) URL")
+		}
 	}
 
 	// 验证平台配置

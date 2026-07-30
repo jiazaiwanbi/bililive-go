@@ -10,6 +10,7 @@ const (
 	StageNameConvertMp4     = "convert_mp4"
 	StageNameExtractCover   = "extract_cover"
 	StageNameCloudUpload    = "cloud_upload"
+	StageNameWebDAVUpload   = "webdav_upload"
 	StageNameCustomCmd      = "custom_command"
 	StageNameBurnSubtitles  = "burn_subtitles"
 )
@@ -22,6 +23,12 @@ const (
 	OptionStorage = "storage"
 	// OptionPathTemplate 上传路径模板
 	OptionPathTemplate = "path_template"
+	// OptionURL 服务地址
+	OptionURL = "url"
+	// OptionUsername 用户名
+	OptionUsername = "username"
+	// OptionPassword 密码
+	OptionPassword = "password"
 	// OptionDeleteAfter 上传后是否删除
 	OptionDeleteAfter = "delete_after"
 	// OptionCommand 自定义命令
@@ -50,6 +57,7 @@ type OnRecordFinishedPipeline struct {
 	FixFlvAtFirst         bool                 `yaml:"fix_flv_at_first,omitempty" json:"fix_flv_at_first,omitempty"`
 	SaveCover             bool                 `yaml:"save_cover,omitempty" json:"save_cover,omitempty"`
 	CloudUpload           configs.CloudUpload  `yaml:"cloud_upload,omitempty" json:"cloud_upload,omitempty"`
+	WebDAVUpload          configs.WebDAVUpload `yaml:"webdav_upload,omitempty" json:"webdav_upload,omitempty"`
 	UploadTiming          configs.UploadTiming `yaml:"upload_timing,omitempty" json:"upload_timing,omitempty"`
 	BurnSubtitles         bool                 `yaml:"burn_subtitles,omitempty" json:"burn_subtitles,omitempty"`
 	BurnSubtitlesCodec    string               `yaml:"burn_subtitles_codec,omitempty" json:"burn_subtitles_codec,omitempty"`
@@ -121,7 +129,21 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 6. 自定义命令（在最后执行）
+	// 6. WebDAV 上传
+	if legacy.WebDAVUpload.Enable && legacy.WebDAVUpload.URL != "" {
+		stages = append(stages, StageConfig{
+			Name: StageNameWebDAVUpload,
+			Options: map[string]any{
+				OptionURL:          legacy.WebDAVUpload.URL,
+				OptionUsername:     legacy.WebDAVUpload.Username,
+				OptionPassword:     legacy.WebDAVUpload.Password,
+				OptionPathTemplate: legacy.WebDAVUpload.RemotePathTmpl,
+				OptionDeleteAfter:  legacy.WebDAVUpload.DeleteAfterUpload,
+			},
+		})
+	}
+
+	// 7. 自定义命令（在最后执行）
 	if legacy.CustomCommandline != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameCustomCmd,

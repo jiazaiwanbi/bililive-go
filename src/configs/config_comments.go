@@ -71,6 +71,18 @@ func DecorateConfigNode(node *yaml.Node) {
 			`# 烧录完成后是否删除源视频文件（如 MP4/FLV）
 # 默认 false（保留源文件，同时存在源文件和烧录后的 MKV）
 # 开启后仅保留烧录完成的 MKV 文件`, "")
+
+		webdavNode := findNode(finishNode, "webdav_upload")
+		if webdavNode != nil {
+			setFieldComment(webdavNode, "url",
+				`# WebDAV 根地址，例如:
+# https://dav.example.com/remote.php/dav/files/username`, "")
+			setFieldComment(webdavNode, "remote_path_tmpl",
+				`# WebDAV 远程文件路径模板
+# 支持 Platform、HostName、RoomName、FileName、Ext 和 now/date`, "")
+			setFieldComment(webdavNode, "delete_after_upload",
+				`# 仅在 WebDAV 服务端确认上传成功后删除本地文件`, "")
+		}
 	}
 
 	setFieldHeadComment(root, "notify", "# 通知服务配置")

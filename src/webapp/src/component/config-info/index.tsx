@@ -24,6 +24,7 @@ import {
   OutputTemplatePreview, getFFmpegInheritance, getFFmpegDisplayValue,
 } from './shared-fields';
 import CloudUploadSettings from './CloudUploadSettings';
+import WebDAVUploadSettings from './WebDAVUploadSettings';
 
 const api = new API();
 const { TextArea } = Input;
@@ -79,6 +80,14 @@ interface EffectiveConfig {
     delete_flv_after_convert: boolean;
     custom_commandline: string;
     fix_flv_at_first: boolean;
+    webdav_upload: {
+      enable: boolean;
+      url: string;
+      username: string;
+      password: string;
+      remote_path_tmpl: string;
+      delete_after_upload: boolean;
+    };
   };
   timeout_in_us: number;
   timeout_in_seconds: number;
@@ -660,7 +669,7 @@ const GlobalSettings: React.FC<{
               <Switch />
             </Form.Item>
           </ConfigField>
-          <ConfigField label="转换为 MP4" description="录制完成后自动将 FLV 转换为 MP4">
+          <ConfigField label="自动转换为 MP4" description="录制完成后自动将 FLV 无损封装为 MP4；关闭则保留原始格式">
             <Form.Item name={['on_record_finished', 'convert_to_mp4']} valuePropName="checked" noStyle>
               <Switch />
             </Form.Item>
@@ -684,6 +693,8 @@ const GlobalSettings: React.FC<{
 
         {/* 云盘上传设置（开发中） */}
         {ENABLE_CLOUD_UPLOAD_SETTINGS && <CloudUploadSettings config={config} />}
+
+        <WebDAVUploadSettings config={config} />
 
         {/* 高级设置 */}
         <Card title="高级设置" size="small" style={{ marginBottom: 16 }}>
@@ -1687,9 +1698,12 @@ export const RoomConfigForm: React.FC<{
         </Form.Item>
       </ConfigField>
 
-      <ConfigField label="仅录制音频">
+      <ConfigField
+        label="录制内容"
+        description="选择视频录制或仅保留音频；仅音频模式输出 AAC 文件"
+      >
         <Form.Item name="audio_only" valuePropName="checked" noStyle>
-          <Switch />
+          <Switch checkedChildren="音频" unCheckedChildren="视频" />
         </Form.Item>
       </ConfigField>
 

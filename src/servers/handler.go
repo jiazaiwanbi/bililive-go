@@ -1691,6 +1691,46 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		if fixFlv, ok := orf["fix_flv_at_first"].(bool); ok {
 			c.OnRecordFinished.FixFlvAtFirst = fixFlv
 		}
+		if saveCover, ok := orf["save_cover"].(bool); ok {
+			c.OnRecordFinished.SaveCover = saveCover
+		}
+		if uploadTiming, ok := orf["upload_timing"].(string); ok {
+			c.OnRecordFinished.UploadTiming = configs.UploadTiming(uploadTiming)
+		}
+		if cloudUpload, ok := orf["cloud_upload"].(map[string]interface{}); ok {
+			if enable, ok := cloudUpload["enable"].(bool); ok {
+				c.OnRecordFinished.CloudUpload.Enable = enable
+			}
+			if storageName, ok := cloudUpload["storage_name"].(string); ok {
+				c.OnRecordFinished.CloudUpload.StorageName = storageName
+			}
+			if uploadPathTmpl, ok := cloudUpload["upload_path_tmpl"].(string); ok {
+				c.OnRecordFinished.CloudUpload.UploadPathTmpl = uploadPathTmpl
+			}
+			if deleteAfterUpload, ok := cloudUpload["delete_after_upload"].(bool); ok {
+				c.OnRecordFinished.CloudUpload.DeleteAfterUpload = deleteAfterUpload
+			}
+		}
+		if webdavUpload, ok := orf["webdav_upload"].(map[string]interface{}); ok {
+			if enable, ok := webdavUpload["enable"].(bool); ok {
+				c.OnRecordFinished.WebDAVUpload.Enable = enable
+			}
+			if webdavURL, ok := webdavUpload["url"].(string); ok {
+				c.OnRecordFinished.WebDAVUpload.URL = strings.TrimSpace(webdavURL)
+			}
+			if username, ok := webdavUpload["username"].(string); ok {
+				c.OnRecordFinished.WebDAVUpload.Username = username
+			}
+			if password, ok := webdavUpload["password"].(string); ok {
+				c.OnRecordFinished.WebDAVUpload.Password = password
+			}
+			if remotePathTmpl, ok := webdavUpload["remote_path_tmpl"].(string); ok {
+				c.OnRecordFinished.WebDAVUpload.RemotePathTmpl = remotePathTmpl
+			}
+			if deleteAfterUpload, ok := webdavUpload["delete_after_upload"].(bool); ok {
+				c.OnRecordFinished.WebDAVUpload.DeleteAfterUpload = deleteAfterUpload
+			}
+		}
 		if burnSubtitles, ok := orf["burn_subtitles"].(bool); ok {
 			c.OnRecordFinished.BurnSubtitles = burnSubtitles
 		}
