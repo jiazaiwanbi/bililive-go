@@ -370,6 +370,8 @@ type WebDAVUpload struct {
 type OnRecordFinished struct {
 	ConvertToMp4          bool         `yaml:"convert_to_mp4" json:"convert_to_mp4"`
 	DeleteFlvAfterConvert bool         `yaml:"delete_flv_after_convert" json:"delete_flv_after_convert"`
+	ConvertAACToM4A       bool         `yaml:"convert_aac_to_m4a" json:"convert_aac_to_m4a"`
+	DeleteAACAfterConvert bool         `yaml:"delete_aac_after_convert" json:"delete_aac_after_convert"`
 	CustomCommandline     string       `yaml:"custom_commandline" json:"custom_commandline"`
 	FixFlvAtFirst         bool         `yaml:"fix_flv_at_first" json:"fix_flv_at_first"`
 	SaveCover             bool         `yaml:"save_cover" json:"save_cover"`       // 保存视频第一帧作为封面图（.jpg）
@@ -980,6 +982,8 @@ var defaultConfig = Config{
 	OnRecordFinished: OnRecordFinished{
 		ConvertToMp4:          false,
 		DeleteFlvAfterConvert: false,
+		ConvertAACToM4A:       false,
+		DeleteAACAfterConvert: false,
 		FixFlvAtFirst:         true,
 		SaveCover:             false,
 		CloudUpload: CloudUpload{

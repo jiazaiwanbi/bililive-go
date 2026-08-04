@@ -1685,6 +1685,12 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		if deleteFlv, ok := orf["delete_flv_after_convert"].(bool); ok {
 			c.OnRecordFinished.DeleteFlvAfterConvert = deleteFlv
 		}
+		if convertAAC, ok := orf["convert_aac_to_m4a"].(bool); ok {
+			c.OnRecordFinished.ConvertAACToM4A = convertAAC
+		}
+		if deleteAAC, ok := orf["delete_aac_after_convert"].(bool); ok {
+			c.OnRecordFinished.DeleteAACAfterConvert = deleteAAC
+		}
 		if customCmd, ok := orf["custom_commandline"].(string); ok {
 			c.OnRecordFinished.CustomCommandline = customCmd
 		}
@@ -2006,6 +2012,7 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 
 	// 记录更新前的 NotifyOnly 状态，用于判断是否需要自动开始录制
 	var wasNotifyOnly bool
+	var updatedRoom configs.LiveRoom
 	inst := instance.GetInstance(r.Context())
 
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
@@ -2069,6 +2076,7 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("弹幕参数无效: %w", err)
 			}
 		}
+		updatedRoom = *room
 
 		return nil
 	}, 3, 10*time.Millisecond)
@@ -2080,6 +2088,10 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// 配置文件更新后立即同步运行中的 Live 对象，避免 API 已显示音频模式，
+	// 但当前进程仍继续按旧的视频模式录制。
+	syncLiveOptionsByRoom(inst.Ctx, &updatedRoom)
 
 	// 如果从 NotifyOnly 切换为普通模式，检查是否正在直播并自动开始录制
 	if notifyOnly, ok := updates["notify_only"].(bool); ok {
@@ -2317,6 +2329,7 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var updatedRoom configs.LiveRoom
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
 		room, err := c.GetLiveRoomByUrl(decodedUrl)
 		if err != nil {
@@ -2347,6 +2360,7 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("弹幕配置无效: %w", err)
 			}
 		}
+		updatedRoom = *room
 
 		return nil
 	}, 3, 10*time.Millisecond)
@@ -2359,9 +2373,38 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	syncLiveOptionsByRoom(instance.GetInstance(r.Context()).Ctx, &updatedRoom)
+
 	writeJSON(writer, commonResp{
 		Data: "OK",
 	})
+}
+
+// syncLiveOptionsByRoom 将单个房间配置同步到当前运行中的 Live 对象。
+// LiveId 不存在时按 URL 回退查找，兼容尚未把运行态 ID 写回 YAML 的旧配置。
+func syncLiveOptionsByRoom(ctx context.Context, room *configs.LiveRoom) {
+	if room == nil || room.Url == "" {
+		return
+	}
+
+	inst := instance.GetInstance(ctx)
+	liveObj, _ := inst.Lives.Get(room.LiveId)
+	if liveObj == nil {
+		inst.Lives.Range(func(_ types.LiveID, candidate live.Live) bool {
+			if candidate.GetRawUrl() == room.Url {
+				liveObj = candidate
+				return false
+			}
+			return true
+		})
+	}
+	if liveObj == nil {
+		applog.GetLogger().Warn("can't find live by id or url: " + string(room.LiveId) + " " + room.Url)
+		return
+	}
+	if err := liveObj.UpdateLiveOptionsbyConfig(ctx, room); err != nil {
+		liveObj.GetLogger().WithError(err).Warn("同步直播间运行配置失败")
+	}
 }
 
 // getSafePath 验证并生成安全的绝对路径，防止路径遍历（Path Traversal）攻击。

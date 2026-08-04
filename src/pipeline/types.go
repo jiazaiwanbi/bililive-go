@@ -21,6 +21,8 @@ type FileType string
 const (
 	// FileTypeVideo 视频文件
 	FileTypeVideo FileType = "video"
+	// FileTypeAudio 音频文件
+	FileTypeAudio FileType = "audio"
 	// FileTypeCover 封面文件
 	FileTypeCover FileType = "cover"
 	// FileTypeOther 其他文件
@@ -40,6 +42,14 @@ func NewVideoFileInfo(path string) FileInfo {
 	return FileInfo{
 		Path: path,
 		Type: FileTypeVideo,
+	}
+}
+
+// NewAudioFileInfo 创建音频文件信息
+func NewAudioFileInfo(path string) FileInfo {
+	return FileInfo{
+		Path: path,
+		Type: FileTypeAudio,
 	}
 }
 

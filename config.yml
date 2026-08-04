@@ -31,7 +31,13 @@ video_split_strategies:
 on_record_finished:
   convert_to_mp4: false
   delete_flv_after_convert: false
-  #  当 custom_commandline 的值 不为空时，convert_to_mp4 的值会被无视，
+  # 是否将仅音频录制生成的 AAC 无损封装为 M4A
+  # 转换阶段在云上传和 WebDAV 上传之前执行
+  convert_aac_to_m4a: false
+  # M4A 转换成功后是否删除原始 AAC 文件
+  # 转换失败时会保留 AAC，避免录制内容丢失
+  delete_aac_after_convert: false
+  #  当 custom_commandline 的值不为空时，自动格式转换配置会被无视，
   #  而是在录制结束后直接执行 custom_commandline 中的命令。
   #  在 custom_commandline 执行结束后，程序还会继续查看 delete_flv_after_convert 的值，
   #  来判断是否需要删除原始 flv 文件。

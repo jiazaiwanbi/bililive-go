@@ -11,6 +11,9 @@ func RegisterBuiltinStages(executor *pipeline.Executor) {
 	// MP4 转换
 	executor.RegisterStage(pipeline.StageNameConvertMp4, NewConvertMp4Stage)
 
+	// AAC 无损封装为 M4A
+	executor.RegisterStage(pipeline.StageNameConvertM4A, NewConvertM4AStage)
+
 	// 弹幕字幕烧录
 	executor.RegisterStage(pipeline.StageNameBurnSubtitles, NewBurnSubtitlesStage)
 
@@ -40,6 +43,9 @@ func RegisterBuiltinStagesToManager(manager *pipeline.Manager) {
 
 	// MP4 转换
 	manager.RegisterStage(pipeline.StageNameConvertMp4, NewConvertMp4Stage)
+
+	// AAC 无损封装为 M4A
+	manager.RegisterStage(pipeline.StageNameConvertM4A, NewConvertM4AStage)
 
 	// 弹幕字幕烧录
 	manager.RegisterStage(pipeline.StageNameBurnSubtitles, NewBurnSubtitlesStage)

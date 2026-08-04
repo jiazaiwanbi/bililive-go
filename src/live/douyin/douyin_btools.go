@@ -154,10 +154,11 @@ func (l *btoolsLive) fetchStreamInfo() (streamInfo streamInfoResp, err error) {
 
 func (l *btoolsLive) GetInfo() (info *live.Info, err error) {
 	ret := &live.Info{
-		Live:     l.Live,
-		HostName: l.hostName,
-		RoomName: l.roomName,
-		Status:   false,
+		Live:      l.Live,
+		HostName:  l.hostName,
+		RoomName:  l.roomName,
+		Status:    false,
+		AudioOnly: l.GetOptions().AudioOnly,
 	}
 
 	var liveInfo liveInfoResp

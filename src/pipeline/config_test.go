@@ -32,3 +32,19 @@ func TestConvertLegacyConfigIncludesWebDAVUpload(t *testing.T) {
 	assert.Equal(t, "/archive/{{ .FileName }}", webdavStage.Options[OptionPathTemplate])
 	assert.Equal(t, true, webdavStage.Options[OptionDeleteAfter])
 }
+
+func TestConvertLegacyConfigConvertsAACBeforeWebDAV(t *testing.T) {
+	config := ConvertLegacyConfig(&configs.OnRecordFinished{
+		ConvertAACToM4A:       true,
+		DeleteAACAfterConvert: true,
+		WebDAVUpload: configs.WebDAVUpload{
+			Enable: true,
+			URL:    "https://dav.example.com/root",
+		},
+	})
+
+	require.Len(t, config.Stages, 2)
+	assert.Equal(t, StageNameConvertM4A, config.Stages[0].Name)
+	assert.Equal(t, true, config.Stages[0].Options[OptionDeleteSource])
+	assert.Equal(t, StageNameWebDAVUpload, config.Stages[1].Name)
+}

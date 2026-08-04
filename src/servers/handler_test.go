@@ -58,3 +58,17 @@ func TestApplyConfigUpdatesWebDAVUpload(t *testing.T) {
 		DeleteAfterUpload: true,
 	}, cfg.OnRecordFinished.WebDAVUpload)
 }
+
+func TestApplyConfigUpdatesAACToM4A(t *testing.T) {
+	cfg := configs.NewConfig()
+	err := applyConfigUpdates(cfg, map[string]interface{}{
+		"on_record_finished": map[string]interface{}{
+			"convert_aac_to_m4a":       true,
+			"delete_aac_after_convert": true,
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.True(t, cfg.OnRecordFinished.ConvertAACToM4A)
+	assert.True(t, cfg.OnRecordFinished.DeleteAACAfterConvert)
+}

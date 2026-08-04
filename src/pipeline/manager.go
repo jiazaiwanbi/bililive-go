@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -285,7 +287,12 @@ func (m *Manager) EnqueueRecordingTask(
 	// 构建文件信息列表
 	files := make([]FileInfo, len(outputFiles))
 	for i, path := range outputFiles {
-		files[i] = NewVideoFileInfo(path)
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".aac", ".m4a", ".mp3", ".flac", ".wav", ".ogg", ".opus":
+			files[i] = NewAudioFileInfo(path)
+		default:
+			files[i] = NewVideoFileInfo(path)
+		}
 	}
 
 	// 创建任务

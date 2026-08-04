@@ -339,6 +339,9 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		room = &configs.LiveRoom{Url: r.Live.GetRawUrl()}
 	}
 	resolvedConfig := cfg.ResolveConfigForRoom(room, platformKey)
+	// 音频模式属于房间配置。平台的 GetInfo 实现不一定会把该选项回填到
+	// live.Info，因此录制行为必须以本次解析到的配置为准。
+	audioOnly := room.AudioOnly
 
 	var streamInfos []*live.StreamUrlInfo
 	var err error
@@ -406,7 +409,7 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		fileName = fileName[:len(fileName)-4] + ".ts"
 	}
 
-	if info.AudioOnly {
+	if audioOnly {
 		fileName = fileName[:strings.LastIndex(fileName, ".")] + ".aac"
 	}
 
@@ -416,7 +419,7 @@ func (r *recorder) tryRecord(ctx context.Context) {
 	}
 	parserCfg := map[string]string{
 		"timeout_in_us": strconv.Itoa(resolvedConfig.TimeoutInUs),
-		"audio_only":    strconv.FormatBool(info.AudioOnly),
+		"audio_only":    strconv.FormatBool(audioOnly),
 	}
 	// 使用层级配置的下载器类型
 	downloaderType := resolvedConfig.Feature.GetEffectiveDownloaderType()

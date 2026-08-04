@@ -6,13 +6,14 @@ import (
 
 // 内置阶段名称常量
 const (
-	StageNameFixFlv         = "fix_flv"
-	StageNameConvertMp4     = "convert_mp4"
-	StageNameExtractCover   = "extract_cover"
-	StageNameCloudUpload    = "cloud_upload"
-	StageNameWebDAVUpload   = "webdav_upload"
-	StageNameCustomCmd      = "custom_command"
-	StageNameBurnSubtitles  = "burn_subtitles"
+	StageNameFixFlv        = "fix_flv"
+	StageNameConvertMp4    = "convert_mp4"
+	StageNameConvertM4A    = "convert_m4a"
+	StageNameExtractCover  = "extract_cover"
+	StageNameCloudUpload   = "cloud_upload"
+	StageNameWebDAVUpload  = "webdav_upload"
+	StageNameCustomCmd     = "custom_command"
+	StageNameBurnSubtitles = "burn_subtitles"
 )
 
 // 阶段选项键常量
@@ -53,6 +54,8 @@ type OnRecordFinishedPipeline struct {
 	// 旧格式字段（向后兼容）
 	ConvertToMp4          bool                 `yaml:"convert_to_mp4,omitempty" json:"convert_to_mp4,omitempty"`
 	DeleteFlvAfterConvert bool                 `yaml:"delete_flv_after_convert,omitempty" json:"delete_flv_after_convert,omitempty"`
+	ConvertAACToM4A       bool                 `yaml:"convert_aac_to_m4a,omitempty" json:"convert_aac_to_m4a,omitempty"`
+	DeleteAACAfterConvert bool                 `yaml:"delete_aac_after_convert,omitempty" json:"delete_aac_after_convert,omitempty"`
 	CustomCommandline     string               `yaml:"custom_commandline,omitempty" json:"custom_commandline,omitempty"`
 	FixFlvAtFirst         bool                 `yaml:"fix_flv_at_first,omitempty" json:"fix_flv_at_first,omitempty"`
 	SaveCover             bool                 `yaml:"save_cover,omitempty" json:"save_cover,omitempty"`
@@ -96,28 +99,38 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 3. 弹幕字幕烧录（在 MP4 转换之后，封面提取之前）
+	// 3. AAC 无损封装为 M4A。该阶段会跳过非 AAC 文件，必须在上传阶段之前执行。
+	if legacy.ConvertAACToM4A {
+		stages = append(stages, StageConfig{
+			Name: StageNameConvertM4A,
+			Options: map[string]any{
+				OptionDeleteSource: legacy.DeleteAACAfterConvert,
+			},
+		})
+	}
+
+	// 4. 弹幕字幕烧录（在格式转换之后，封面提取之前）
 	if legacy.BurnSubtitles {
 		stages = append(stages, StageConfig{
 			Name: StageNameBurnSubtitles,
 			Options: map[string]any{
-				OptionCodec:           legacy.BurnSubtitlesCodec,
-				OptionCrf:             legacy.BurnSubtitlesCrf,
-				OptionPreset:          legacy.BurnSubtitlesPreset,
-				OptionBurnDeleteAss:   legacy.BurnDeleteAss,
+				OptionCodec:            legacy.BurnSubtitlesCodec,
+				OptionCrf:              legacy.BurnSubtitlesCrf,
+				OptionPreset:           legacy.BurnSubtitlesPreset,
+				OptionBurnDeleteAss:    legacy.BurnDeleteAss,
 				OptionBurnDeleteSource: legacy.BurnDeleteSource,
 			},
 		})
 	}
 
-	// 4. 封面提取
+	// 5. 封面提取
 	if legacy.SaveCover {
 		stages = append(stages, StageConfig{
 			Name: StageNameExtractCover,
 		})
 	}
 
-	// 5. 云上传
+	// 6. 云上传
 	if legacy.CloudUpload.Enable && legacy.CloudUpload.StorageName != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameCloudUpload,
@@ -129,7 +142,7 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 6. WebDAV 上传
+	// 7. WebDAV 上传
 	if legacy.WebDAVUpload.Enable && legacy.WebDAVUpload.URL != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameWebDAVUpload,
@@ -143,7 +156,7 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 7. 自定义命令（在最后执行）
+	// 8. 自定义命令（在最后执行）
 	if legacy.CustomCommandline != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameCustomCmd,

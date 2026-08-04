@@ -78,6 +78,8 @@ interface EffectiveConfig {
   on_record_finished: {
     convert_to_mp4: boolean;
     delete_flv_after_convert: boolean;
+    convert_aac_to_m4a: boolean;
+    delete_aac_after_convert: boolean;
     custom_commandline: string;
     fix_flv_at_first: boolean;
     webdav_upload: {
@@ -679,7 +681,17 @@ const GlobalSettings: React.FC<{
               <Switch />
             </Form.Item>
           </ConfigField>
-          <ConfigField label="自定义命令" description="录制完成后执行的自定义命令，设置后会忽略转换MP4设置">
+          <ConfigField label="AAC 转为 M4A" description="仅音频录制完成后，用 FFmpeg 无损封装为兼容性更好的 M4A；WebDAV 将上传转换后的文件">
+            <Form.Item name={['on_record_finished', 'convert_aac_to_m4a']} valuePropName="checked" noStyle>
+              <Switch />
+            </Form.Item>
+          </ConfigField>
+          <ConfigField label="转换后删除 AAC" description="M4A 转换成功后删除原始 AAC 文件">
+            <Form.Item name={['on_record_finished', 'delete_aac_after_convert']} valuePropName="checked" noStyle>
+              <Switch />
+            </Form.Item>
+          </ConfigField>
+          <ConfigField label="自定义命令" description="录制完成后执行的自定义命令；设置后会忽略自动格式转换配置">
             <Form.Item name={['on_record_finished', 'custom_commandline']} noStyle>
               <TextArea rows={3} placeholder="留空则不执行自定义命令" style={{ width: 500 }} />
             </Form.Item>
@@ -1700,7 +1712,7 @@ export const RoomConfigForm: React.FC<{
 
       <ConfigField
         label="录制内容"
-        description="选择视频录制或仅保留音频；仅音频模式输出 AAC 文件"
+        description="选择视频录制或仅保留音频；仅音频模式先输出 AAC，可在全局配置中自动无损封装为 M4A"
       >
         <Form.Item name="audio_only" valuePropName="checked" noStyle>
           <Switch checkedChildren="音频" unCheckedChildren="视频" />

@@ -66,8 +66,9 @@ func (s *ConvertMp4Stage) Execute(ctx *pipeline.PipelineContext, input []pipelin
 	var output []pipeline.FileInfo
 
 	for _, file := range input {
-		// 只处理视频文件
-		if file.Type != pipeline.FileTypeVideo {
+		// 只处理视频文件。扩展名判断兼容升级前已持久化、仍被标记为 video 的音频任务。
+		ext := strings.ToLower(filepath.Ext(file.Path))
+		if file.Type != pipeline.FileTypeVideo || ext == ".aac" || ext == ".m4a" || ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".ogg" || ext == ".opus" {
 			output = append(output, file)
 			continue
 		}
@@ -79,7 +80,6 @@ func (s *ConvertMp4Stage) Execute(ctx *pipeline.PipelineContext, input []pipelin
 		}
 
 		// 如果已经是 MP4 文件，跳过
-		ext := strings.ToLower(filepath.Ext(file.Path))
 		if ext == ".mp4" {
 			s.logs += fmt.Sprintf("文件 %s 已经是 MP4 格式，跳过转换。\n", filepath.Base(file.Path))
 			output = append(output, file)
