@@ -635,12 +635,19 @@ func (r *recorder) tryRecord(ctx context.Context) {
 	}
 
 	if err != nil {
-		r.getLogger().WithError(err).Error("failed to parse live stream")
-		// 视频流快速失败时（如 404），清理没有对应视频文件的残留弹幕
-		if elapsed := time.Since(r.startTime); elapsed < 5*time.Second {
-			cleanupOrphanedDanmakuFiles(dmFile)
+		// 下播或分段重启会主动停止 parser。FFmpeg 若未在宽限时间内响应
+		// 退出命令，会被强制终止并返回 signal: killed；此时已经写入的录制
+		// 文件仍是有效产物，不能因为停止错误而跳过后处理。
+		if r.canPostProcessStoppedRecording(fileName) {
+			r.getLogger().WithError(err).Warn("录制器停止时 parser 非正常退出，但输出文件非空，继续后处理")
+		} else {
+			r.getLogger().WithError(err).Error("failed to parse live stream")
+			// 视频流快速失败时（如 404），清理没有对应视频文件的残留弹幕
+			if elapsed := time.Since(r.startTime); elapsed < 5*time.Second {
+				cleanupOrphanedDanmakuFiles(dmFile)
+			}
+			return
 		}
-		return
 	}
 
 	// 录制成功，累积弹幕文件
@@ -793,6 +800,19 @@ func (r *recorder) tryRecord(ctx context.Context) {
 			r.getLogger().Infof("pipeline task enqueued: %d files, %d stages", len(outputFiles), len(pipelineConfig.Stages))
 		}
 	}
+}
+
+// canPostProcessStoppedRecording 判断 parser 错误是否来自录制器的受控停止，
+// 且本次录制已经产生了可供后处理的非空普通文件。
+func (r *recorder) canPostProcessStoppedRecording(fileName string) bool {
+	select {
+	case <-r.stop:
+	default:
+		return false
+	}
+
+	fileInfo, statErr := os.Stat(fileName)
+	return statErr == nil && fileInfo.Mode().IsRegular() && fileInfo.Size() > 0
 }
 
 // danmakuRecorderFactory 弹幕录制器工厂函数类型

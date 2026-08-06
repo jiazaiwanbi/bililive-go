@@ -123,8 +123,6 @@ func (s *ConvertM4AStage) Execute(ctx *pipeline.PipelineContext, input []pipelin
 			} else {
 				s.logs += fmt.Sprintf("已删除原始 AAC: %s\n", file.Path)
 			}
-		} else {
-			output = append(output, file)
 		}
 
 		s.logs += fmt.Sprintf("封装完成: %s -> %s\n", filepath.Base(file.Path), filepath.Base(outputPath))

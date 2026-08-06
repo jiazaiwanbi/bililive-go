@@ -3,11 +3,15 @@ package recorders
 import (
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/bluele/gcache"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	gomock "go.uber.org/mock/gomock"
 
 	"github.com/bililive-go/bililive-go/src/configs"
@@ -49,4 +53,22 @@ func TestTryRecordStopsWithoutPanicWhenFilenameRenderFails(t *testing.T) {
 	if !strings.Contains(logs, "render failed") {
 		t.Fatalf("日志未保留原始模板错误: %s", logs)
 	}
+}
+
+func TestCanPostProcessStoppedRecording(t *testing.T) {
+	tempDir := t.TempDir()
+	recordingPath := filepath.Join(tempDir, "record.aac")
+	require.NoError(t, os.WriteFile(recordingPath, []byte("audio-data"), 0o600))
+
+	activeRecorder := &recorder{stop: make(chan struct{})}
+	assert.False(t, activeRecorder.canPostProcessStoppedRecording(recordingPath))
+
+	stoppedRecorder := &recorder{stop: make(chan struct{})}
+	close(stoppedRecorder.stop)
+	assert.True(t, stoppedRecorder.canPostProcessStoppedRecording(recordingPath))
+	assert.False(t, stoppedRecorder.canPostProcessStoppedRecording(filepath.Join(tempDir, "missing.aac")))
+
+	emptyPath := filepath.Join(tempDir, "empty.aac")
+	require.NoError(t, os.WriteFile(emptyPath, nil, 0o600))
+	assert.False(t, stoppedRecorder.canPostProcessStoppedRecording(emptyPath))
 }
