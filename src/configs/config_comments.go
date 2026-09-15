@@ -36,7 +36,7 @@ func DecorateConfigNode(node *yaml.Node) {
 	if finishNode != nil {
 		setFieldComment(finishNode, "convert_aac_to_m4a",
 			`# 是否将仅音频录制生成的 AAC 无损封装为 M4A
-# 转换阶段在云上传和 WebDAV 上传之前执行`, "")
+# 转换阶段在后处理云上传和 WebDAV 上传之前执行（立即上传模式除外）`, "")
 		setFieldComment(finishNode, "delete_aac_after_convert",
 			`# M4A 转换成功后是否删除原始 AAC 文件
 # 转换失败时会保留 AAC，避免录制内容丢失`, "")
@@ -91,7 +91,6 @@ func DecorateConfigNode(node *yaml.Node) {
 				`# 仅在 WebDAV 服务端确认上传成功后删除本地文件`, "")
 		}
 	}
-
 	setFieldHeadComment(root, "notify", "# 通知服务配置")
 	notifyNode := findNode(root, "notify")
 	if notifyNode != nil {

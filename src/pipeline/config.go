@@ -30,12 +30,18 @@ const (
 	OptionUsername = "username"
 	// OptionPassword 密码
 	OptionPassword = "password"
-	// OptionDeleteAfter 上传后是否删除
+	// OptionDeleteAfter 上传后是否删除已上传的文件
 	OptionDeleteAfter = "delete_after"
+	// OptionDeleteAllAfter 上传后是否删除全部文件（含中间产物）
+	OptionDeleteAllAfter = "delete_all_after"
+	// OptionUploadTiming 上传时机（immediate/after_process）
+	OptionUploadTiming = "upload_timing"
 	// OptionCommand 自定义命令
 	OptionCommand = "command"
 	// OptionFileTypes 处理的文件类型过滤
 	OptionFileTypes = "file_types"
+	// OptionUploadSubtitles 是否上传关联的 .ass 弹幕字幕文件
+	OptionUploadSubtitles = "upload_subtitles"
 	// OptionCodec 视频编码器
 	OptionCodec = "codec"
 	// OptionCrf CRF 质量值
@@ -82,14 +88,34 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 
 	var stages []StageConfig
 
-	// 1. FLV 修复（在转换之前）
+	// 构建云上传阶段配置
+	cloudUploadStage := StageConfig{
+		Name: StageNameCloudUpload,
+		Options: map[string]any{
+			OptionStorage:         legacy.CloudUpload.StorageName,
+			OptionPathTemplate:    legacy.CloudUpload.UploadPathTmpl,
+			OptionDeleteAfter:     legacy.CloudUpload.DeleteAfterUpload,
+			OptionDeleteAllAfter:  legacy.CloudUpload.DeleteAllAfterUpload,
+			OptionUploadTiming:    string(legacy.UploadTiming),
+			OptionFileTypes:       []string{string(FileTypeVideo), string(FileTypeCover)},
+			OptionUploadSubtitles: legacy.CloudUpload.UploadSubtitles,
+		},
+	}
+	hasCloudUpload := legacy.CloudUpload.Enable && legacy.CloudUpload.StorageName != ""
+
+	// 立即上传模式：上传在所有处理之前
+	if hasCloudUpload && legacy.UploadTiming == configs.UploadTimingImmediate {
+		stages = append(stages, cloudUploadStage)
+	}
+
+	// FLV 修复（在转换之前）
 	if legacy.FixFlvAtFirst {
 		stages = append(stages, StageConfig{
 			Name: StageNameFixFlv,
 		})
 	}
 
-	// 2. MP4 转换
+	// MP4 转换
 	if legacy.ConvertToMp4 {
 		stages = append(stages, StageConfig{
 			Name: StageNameConvertMp4,
@@ -99,7 +125,7 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 3. AAC 无损封装为 M4A。该阶段会跳过非 AAC 文件，必须在上传阶段之前执行。
+	// AAC 无损封装为 M4A。该阶段会跳过非 AAC 文件。
 	if legacy.ConvertAACToM4A {
 		stages = append(stages, StageConfig{
 			Name: StageNameConvertM4A,
@@ -109,7 +135,7 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 4. 弹幕字幕烧录（在格式转换之后，封面提取之前）
+	// 弹幕字幕烧录（在格式转换之后，封面提取之前）
 	if legacy.BurnSubtitles {
 		stages = append(stages, StageConfig{
 			Name: StageNameBurnSubtitles,
@@ -123,26 +149,19 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 5. 封面提取
+	// 封面提取
 	if legacy.SaveCover {
 		stages = append(stages, StageConfig{
 			Name: StageNameExtractCover,
 		})
 	}
 
-	// 6. 云上传
-	if legacy.CloudUpload.Enable && legacy.CloudUpload.StorageName != "" {
-		stages = append(stages, StageConfig{
-			Name: StageNameCloudUpload,
-			Options: map[string]any{
-				OptionStorage:      legacy.CloudUpload.StorageName,
-				OptionPathTemplate: legacy.CloudUpload.UploadPathTmpl,
-				OptionDeleteAfter:  legacy.CloudUpload.DeleteAfterUpload,
-			},
-		})
+	// 后处理完成后上传模式：上传在所有处理之后（默认行为）
+	if hasCloudUpload && legacy.UploadTiming != configs.UploadTimingImmediate {
+		stages = append(stages, cloudUploadStage)
 	}
 
-	// 7. WebDAV 上传
+	// WebDAV 上传始终在后处理完成后执行
 	if legacy.WebDAVUpload.Enable && legacy.WebDAVUpload.URL != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameWebDAVUpload,
@@ -156,7 +175,7 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 8. 自定义命令（在最后执行）
+	// 自定义命令（在最后执行）
 	if legacy.CustomCommandline != "" {
 		stages = append(stages, StageConfig{
 			Name: StageNameCustomCmd,

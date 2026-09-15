@@ -32,7 +32,7 @@ const { TextArea } = Input;
 // 功能开关：代理配置（开发中，设为 false 隐藏 UI）
 // 与后端 configs.EnableProxyConfig 对应
 const ENABLE_PROXY_CONFIG = false;
-const ENABLE_CLOUD_UPLOAD_SETTINGS = false;
+const ENABLE_CLOUD_UPLOAD_SETTINGS = true;
 const { Panel } = Collapse;
 
 // 配置项类型定义
@@ -82,6 +82,14 @@ interface EffectiveConfig {
     delete_aac_after_convert: boolean;
     custom_commandline: string;
     fix_flv_at_first: boolean;
+    cloud_upload: {
+      enable: boolean;
+      storage_name: string;
+      upload_path_tmpl: string;
+      delete_after_upload: boolean;
+      delete_all_after_upload: boolean;
+      upload_subtitles: boolean;
+    };
     webdav_upload: {
       enable: boolean;
       url: string;
@@ -90,6 +98,20 @@ interface EffectiveConfig {
       remote_path_tmpl: string;
       delete_after_upload: boolean;
     };
+    upload_timing: string;
+    burn_subtitles: boolean;
+    burn_subtitles_codec: string;
+    burn_subtitles_crf: string;
+    burn_subtitles_preset: string;
+    burn_delete_ass: boolean;
+    burn_delete_source: boolean;
+  };
+  openlist: {
+    port: number;
+    data_path: string;
+    username: string;
+    password: string;
+    token: string;
   };
   timeout_in_us: number;
   timeout_in_seconds: number;
@@ -172,6 +194,7 @@ interface PlatformStatsResponse {
   platforms: PlatformStat[];
   available_platforms: string[];
   global_interval: number;
+  platform_rate_limit_enabled?: boolean;
 }
 
 // 实际生效值显示组件
@@ -676,7 +699,7 @@ const GlobalSettings: React.FC<{
               <Switch />
             </Form.Item>
           </ConfigField>
-          <ConfigField label="转换后删除 FLV" description="MP4 转换成功后删除原始 FLV 文件">
+          <ConfigField label="转换后删除 FLV" description="MP4 转换成功后标记原始 FLV 为待删除，全部处理阶段完成后才真正删除">
             <Form.Item name={['on_record_finished', 'delete_flv_after_convert']} valuePropName="checked" noStyle>
               <Switch />
             </Form.Item>
@@ -704,7 +727,7 @@ const GlobalSettings: React.FC<{
         </Card>
 
         {/* 云盘上传设置（开发中） */}
-        {ENABLE_CLOUD_UPLOAD_SETTINGS && <CloudUploadSettings config={config} />}
+        {ENABLE_CLOUD_UPLOAD_SETTINGS && <CloudUploadSettings config={config} form={form} />}
 
         <WebDAVUploadSettings config={config} />
 
@@ -1083,6 +1106,7 @@ const PlatformSettings: React.FC<{
   }
 
   const { platforms, available_platforms, global_interval } = platformStats;
+  const platformRateLimitEnabled = platformStats.platform_rate_limit_enabled ?? true;
 
   // 分组平台：有直播间的 vs 只有配置没有直播间的
   const platformsWithRooms = platforms.filter(p => p.has_rooms);
@@ -1187,6 +1211,7 @@ const PlatformSettings: React.FC<{
             platform={platform}
             globalConfig={globalConfig}
             globalInterval={global_interval}
+            platformRateLimitEnabled={platformRateLimitEnabled}
             onSave={(values) => handleSave(platform.platform_key, values)}
             onDelete={() => handleDelete(platform.platform_key)}
             loading={loading}
@@ -1209,6 +1234,15 @@ const PlatformSettings: React.FC<{
         showIcon
         style={{ marginBottom: 16 }}
       />
+      {!platformRateLimitEnabled && (
+        <Alert
+          message="平台级访问限流已暂时停用"
+          description="min_access_interval_sec 配置会被保留，但当前不会限制请求间隔或同平台并发。后续调度策略改善后再恢复生效。"
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+      )}
 
       {/* 正在监控的平台 */}
       {platformsWithRooms.length > 0 && (
@@ -1258,11 +1292,12 @@ const PlatformConfigForm: React.FC<{
   platform: PlatformStat;
   globalConfig: EffectiveConfig;
   globalInterval: number;
+  platformRateLimitEnabled: boolean;
   onSave: (values: any) => void;
   onDelete: () => void;
   loading: boolean;
   onNavigateToRoom: (liveId: string) => void;
-}> = ({ platform, globalConfig, globalInterval, onSave, onDelete, loading, onNavigateToRoom }) => {
+}> = ({ platform, globalConfig, globalInterval, platformRateLimitEnabled, onSave, onDelete, loading, onNavigateToRoom }) => {
   const [form] = Form.useForm();
 
   useEffect(() => {
@@ -1342,18 +1377,31 @@ const PlatformConfigForm: React.FC<{
         </ConfigField>
 
         <ConfigField
-          label="最小访问间隔 (秒)"
-          description="该平台 API 的最小访问间隔，用于防风控。若监控数量过多导致频率过快，系统会自动增加检测间隔。"
+          label={`最小访问间隔 (秒${platformRateLimitEnabled ? '' : '，暂未启用'})`}
+          description={platformRateLimitEnabled
+            ? '该平台 API 的最小访问间隔，用于防风控。若监控数量过多导致频率过快，系统会自动增加检测间隔。'
+            : '配置值会继续保留，但平台级访问限流关闭期间不会生效。'}
           id={`platforms-${platformKey}-min_access_interval_sec`}
-          inheritance={{
+          inheritance={platformRateLimitEnabled ? {
             source: 'default',
             isOverridden: (platform.min_access_interval_sec || 0) > 0,
             inheritedValue: '不限制 (0)',
-          }}
-          valueDisplay={(platform.min_access_interval_sec || 0) > 0 ? platform.min_access_interval_sec : '不限制 (0)'}
+          } : undefined}
+          effectiveValue={platformRateLimitEnabled ? undefined : '当前不生效'}
+          valueDisplay={!platformRateLimitEnabled
+            ? ((platform.min_access_interval_sec || 0) > 0
+              ? `已配置 ${platform.min_access_interval_sec} 秒（暂不生效）`
+              : '暂未启用')
+            : ((platform.min_access_interval_sec || 0) > 0 ? platform.min_access_interval_sec : '不限制 (0)')}
         >
           <Form.Item name="min_access_interval_sec" rules={[{ type: 'number', min: 0, message: '不能为负数' }]}>
-            <InputNumber min={0} max={3600} style={{ width: 200 }} placeholder="0 (不限制)" />
+            <InputNumber
+              min={0}
+              max={3600}
+              style={{ width: 200 }}
+              placeholder="0 (不限制)"
+              disabled={!platformRateLimitEnabled}
+            />
           </Form.Item>
         </ConfigField>
 
