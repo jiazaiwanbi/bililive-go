@@ -171,6 +171,22 @@ class API {
     }
 
     /**
+     * 上传单个文件到云盘
+     * @param path 文件路径
+     */
+    uploadFile(path: string) {
+        return utils.requestPost(`${BASE_URL}/file/upload`, { path });
+    }
+
+    /**
+     * 批量上传文件到云盘
+     * @param paths 文件路径列表
+     */
+    batchUploadFiles(paths: string[]) {
+        return utils.requestPost(`${BASE_URL}/batch/file/upload`, { paths });
+    }
+
+    /**
      * 获取Cookie列表
      */
     getCookieList() {
@@ -342,6 +358,28 @@ class API {
      */
     verifyBilibiliCookie(cookie: string) {
         return utils.requestPost(`${BASE_URL}/bilibili/cookie/verify`, { cookie });
+    }
+
+    /**
+     * 获取斗鱼扫码登录二维码（后端代理）
+     */
+    getDouyuQRCode() {
+        return utils.requestGet(`${BASE_URL}/douyu/qrcode`);
+    }
+
+    /**
+     * 轮询斗鱼扫码登录状态；确认成功后后端自动保存 Cookie
+     * @param code 二维码会话 code
+     */
+    pollDouyuQRCode(code: string) {
+        return utils.requestGet(`${BASE_URL}/douyu/qrcode/poll?code=${encodeURIComponent(code)}`);
+    }
+
+    /**
+     * 获取斗鱼登录 Cookie 的自动续期健康状态（不含任何凭证原文）
+     */
+    getDouyuAuthStatus() {
+        return utils.requestGet(`${BASE_URL}/douyu/auth/status`);
     }
 
     /**

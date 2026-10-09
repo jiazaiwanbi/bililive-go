@@ -107,6 +107,10 @@ func initMux(ctx context.Context) *mux.Router {
 	apiRoute.HandleFunc("/bilibili/qrcode", getBilibiliQRCode).Methods("GET")
 	apiRoute.HandleFunc("/bilibili/qrcode/poll", pollBilibiliQRCode).Methods("GET")
 	apiRoute.HandleFunc("/bilibili/cookie/verify", verifyBilibiliCookie).Methods("POST")
+	// Douyu Login
+	apiRoute.HandleFunc("/douyu/qrcode", getDouyuQRCode).Methods("GET")
+	apiRoute.HandleFunc("/douyu/qrcode/poll", pollDouyuQRCode).Methods("GET")
+	apiRoute.HandleFunc("/douyu/auth/status", getDouyuAuthStatus).Methods("GET")
 	apiRoute.HandleFunc("/sooplive/auth", getSoopLiveAuthConfig).Methods("GET")
 	apiRoute.HandleFunc("/sooplive/auth", clearSoopLiveAuthConfig).Methods("DELETE")
 	apiRoute.HandleFunc("/sooplive/login", loginSoopLive).Methods("POST")
@@ -153,10 +157,11 @@ func initMux(ctx context.Context) *mux.Router {
 	apiRoute.HandleFunc("/openlist/status", getOpenListStatus).Methods("GET")
 	apiRoute.HandleFunc("/openlist/check-storage", checkOpenListStorageHealth).Methods("GET")
 
-	// Pipeline 任务路由
+	// Pipeline 任务路由 + 手动上传路由
 	inst := instance.GetInstance(ctx)
 	if pm := pipeline.GetManager(inst); pm != nil {
 		RegisterPipelineHandlers(apiRoute, pm)
+		RegisterUploadHandlers(apiRoute, pm)
 	}
 
 	// OSRP 开放直播录制协议路由

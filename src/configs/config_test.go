@@ -2,6 +2,7 @@ package configs
 
 import (
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/bililive-go/bililive-go/src/pkg/ratelimit"
@@ -103,7 +104,7 @@ func TestGetPlatformMinAccessInterval(t *testing.T) {
 	assert.Equal(t, 1, interval) // 默认最小间隔为 1 秒，防止无限制高频访问
 }
 
-func TestDefaultPlatformRateLimitSurvivesTransientConfigUpdate(t *testing.T) {
+func TestPlatformRateLimitRemainsDisabledAfterConfigUpdate(t *testing.T) {
 	const roomURL = "https://live.douyin.com/123456"
 	limiter := ratelimit.GetGlobalRateLimiter()
 	t.Cleanup(func() {
@@ -115,16 +116,50 @@ func TestDefaultPlatformRateLimitSurvivesTransientConfigUpdate(t *testing.T) {
 	cfg.RefreshLiveRoomIndexCache()
 	SetCurrentConfig(cfg)
 
-	if got := limiter.GetAllPlatformLimits()[PlatformKeyDouyin]; got != 1 {
-		t.Fatalf("初始默认平台限流 = %d 秒，期望 1 秒", got)
+	if limits := limiter.GetAllPlatformLimits(); len(limits) != 0 {
+		t.Fatalf("配置加载后平台限流应保持关闭，实际限制：%v", limits)
 	}
 
 	if _, err := SetLiveRoomId(roomURL, types.LiveID("douyin-test")); err != nil {
 		t.Fatalf("写入临时 LiveId 失败: %v", err)
 	}
-	if got := limiter.GetAllPlatformLimits()[PlatformKeyDouyin]; got != 1 {
-		t.Fatalf("临时配置更新后的默认平台限流 = %d 秒，期望仍为 1 秒", got)
+	if limits := limiter.GetAllPlatformLimits(); len(limits) != 0 {
+		t.Fatalf("临时配置更新后平台限流应保持关闭，实际限制：%v", limits)
 	}
+}
+
+// TestGetLiveRoomByUrlConcurrent 保证在共享的不可变配置快照上并发查询房间时不会
+// 触发 Go 运行时的 "concurrent map read and map write" fatal error。
+// 回归此前的 bug：GetLiveRoomByUrl 在缓存未命中时会调用 RefreshLiveRoomIndexCache
+// 写入共享快照的 map，与其它 goroutine 的读并发时导致崩溃。
+// 使用 -race 运行可进一步检测数据竞争。
+func TestGetLiveRoomByUrlConcurrent(t *testing.T) {
+	cfg := NewConfig()
+	cfg.LiveRooms = []LiveRoom{
+		{Url: "https://live.bilibili.com/1", IsListening: true},
+		{Url: "https://live.bilibili.com/2", IsListening: true},
+	}
+	cfg.RefreshLiveRoomIndexCache()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				// 交替命中缓存与未命中（触发原先的写-回退路径）。
+				if (i+j)%2 == 0 {
+					room, err := cfg.GetLiveRoomByUrl("https://live.bilibili.com/1")
+					assert.NoError(t, err)
+					assert.Equal(t, "https://live.bilibili.com/1", room.Url)
+				} else {
+					_, err := cfg.GetLiveRoomByUrl("https://live.bilibili.com/does-not-exist")
+					assert.Error(t, err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestBackwardsCompatibility(t *testing.T) {
@@ -185,6 +220,87 @@ func TestSetCookieDeletesEmptyCookie(t *testing.T) {
 	assert.NotNil(t, newCfg)
 	_, exists := newCfg.Cookies["play.sooplive.com"]
 	assert.False(t, exists)
+}
+
+func TestNormalizeLiveRoomUrl(t *testing.T) {
+	assert.Equal(t, "https://www.douyu.com/123", NormalizeLiveRoomUrl("https://m.douyu.com/123"))
+	// 非别名域名原样返回
+	assert.Equal(t, "https://live.douyin.com/456", NormalizeLiveRoomUrl("https://live.douyin.com/456"))
+	assert.Equal(t, "not a url", NormalizeLiveRoomUrl("not a url"))
+	// 抖音首页 query 形态 → 规范长链
+	assert.Equal(t, "https://live.douyin.com/670024121496",
+		NormalizeLiveRoomUrl("https://live.douyin.com/?live_web_rid=670024121496"))
+	assert.Equal(t, "https://live.douyin.com/670024121496",
+		NormalizeLiveRoomUrl("https://live.douyin.com/?activity_name=x&anchor_id=123&live_web_rid=670024121496&z=1"))
+	assert.Equal(t, "https://live.douyin.com/670024121496",
+		NormalizeLiveRoomUrl("https://live.douyin.com?live_web_rid=670024121496"))
+	// 已有 path 房间号时不覆盖 query
+	assert.Equal(t, "https://live.douyin.com/456?live_web_rid=789",
+		NormalizeLiveRoomUrl("https://live.douyin.com/456?live_web_rid=789"))
+	// 无 live_web_rid / 非数字值 / 只认 live_web_rid 不认 room_id，均原样返回
+	assert.Equal(t, "https://live.douyin.com/?room_id=7688588152885267238",
+		NormalizeLiveRoomUrl("https://live.douyin.com/?room_id=7688588152885267238"))
+	assert.Equal(t, "https://live.douyin.com/?live_web_rid=abc123",
+		NormalizeLiveRoomUrl("https://live.douyin.com/?live_web_rid=abc123"))
+	assert.Equal(t, "https://live.douyin.com/?live_web_rid=",
+		NormalizeLiveRoomUrl("https://live.douyin.com/?live_web_rid="))
+	assert.Equal(t, "https://live.douyin.com/", NormalizeLiveRoomUrl("https://live.douyin.com/"))
+}
+
+// 手动编辑配置写入 m.douyu.com 房间时，加载阶段应规范化为 www.douyu.com
+func TestNewConfigPostProcessNormalizesAliasRoom(t *testing.T) {
+	cfg := &Config{LiveRooms: []LiveRoom{
+		{Url: "https://m.douyu.com/9999"},
+		{Url: "https://live.douyin.com/1111"},
+	}}
+	newConfigPostProcess(cfg)
+	assert.Equal(t, "https://www.douyu.com/9999", cfg.LiveRooms[0].Url)
+	assert.Equal(t, "https://live.douyin.com/1111", cfg.LiveRooms[1].Url)
+}
+
+// 规范化后撞成同一 URL 的存量条目（升级前保存的坏形态 + 正常长链）必须去重，避免双录
+func TestNewConfigPostProcessDedupesNormalizedRooms(t *testing.T) {
+	// 抖音：query 形态与长链并存 → 合并为一条
+	cfg := &Config{LiveRooms: []LiveRoom{
+		{Url: "https://live.douyin.com/?live_web_rid=670024121496", IsListening: true},
+		{Url: "https://live.douyin.com/670024121496", IsListening: true},
+		{Url: "https://live.douyin.com/73832228797", IsListening: true},
+	}}
+	newConfigPostProcess(cfg)
+	assert.Len(t, cfg.LiveRooms, 2)
+	assert.Equal(t, "https://live.douyin.com/670024121496", cfg.LiveRooms[0].Url)
+	assert.True(t, cfg.LiveRooms[0].IsListening)
+	assert.Equal(t, "https://live.douyin.com/73832228797", cfg.LiveRooms[1].Url)
+
+	// 斗鱼：别名形态与标准形态并存 → 合并为一条
+	cfg = &Config{LiveRooms: []LiveRoom{
+		{Url: "https://m.douyu.com/123"},
+		{Url: "https://www.douyu.com/123", IsListening: true},
+	}}
+	newConfigPostProcess(cfg)
+	assert.Len(t, cfg.LiveRooms, 1)
+	assert.Equal(t, "https://www.douyu.com/123", cfg.LiveRooms[0].Url)
+	// is_listening 任一为真即为真（先线条目 false，被后线 true 救回）
+	assert.True(t, cfg.LiveRooms[0].IsListening)
+
+	// notify_only 全部为真才为真：录制定单不被 notify_only 副本拖累
+	cfg = &Config{LiveRooms: []LiveRoom{
+		{Url: "https://live.douyin.com/111", IsListening: true},
+		{Url: "https://live.douyin.com/?live_web_rid=111", NotifyOnly: true},
+	}}
+	newConfigPostProcess(cfg)
+	assert.Len(t, cfg.LiveRooms, 1)
+	assert.False(t, cfg.LiveRooms[0].NotifyOnly)
+	assert.True(t, cfg.LiveRooms[0].IsListening)
+
+	// 两条都是 notify_only 时保持仅提醒
+	cfg = &Config{LiveRooms: []LiveRoom{
+		{Url: "https://live.douyin.com/222", NotifyOnly: true, IsListening: true},
+		{Url: "https://live.douyin.com/?live_web_rid=222", NotifyOnly: true, IsListening: true},
+	}}
+	newConfigPostProcess(cfg)
+	assert.Len(t, cfg.LiveRooms, 1)
+	assert.True(t, cfg.LiveRooms[0].NotifyOnly)
 }
 
 func TestHierarchicalConfigFromExistingConfig(t *testing.T) {

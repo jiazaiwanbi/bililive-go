@@ -57,20 +57,25 @@ func (s *FixFlvStage) Execute(ctx *pipeline.PipelineContext, input []pipeline.Fi
 			continue
 		}
 
-		ctx.Logger.Infof("使用 BililiveRecorder 修复 FLV 文件: %s", file.Path)
-
-		// 记录命令
-		command := s.buildCommand(file.Path)
-		if command != "" {
-			s.commands = append(s.commands, command)
-		}
-
-		// 执行修复
-		outputFiles, err := tools.FixFlvByBililiveRecorder(ctx.Ctx, file.Path)
+		// 只有实际启动修复器时才记录命令。
+		result, err := tools.FixFlvByBililiveRecorderWithResult(ctx.Ctx, file.Path, func(int) {
+			ctx.Logger.Infof("使用 BililiveRecorder 修复 FLV 文件: %s", file.Path)
+			if command := s.buildCommand(file.Path); command != "" {
+				s.commands = append(s.commands, command)
+			}
+		})
 		if err != nil {
 			s.logs += fmt.Sprintf("修复失败: %s - %s\n", file.Path, err.Error())
 			return nil, fmt.Errorf("fix FLV failed for %s: %w", file.Path, err)
 		}
+		if result.SkipReason != "" {
+			message := fmt.Sprintf("跳过修复: %s - %s\n", filepath.Base(file.Path), result.SkipReason)
+			s.logs += message
+			ctx.Logger.Warnf("%s", strings.TrimSpace(message))
+			output = append(output, file)
+			continue
+		}
+		outputFiles := result.OutputFiles
 
 		// 添加输出文件
 		for _, outPath := range outputFiles {

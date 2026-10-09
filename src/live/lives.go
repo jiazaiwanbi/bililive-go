@@ -230,6 +230,20 @@ type Live interface {
 // 此时不应该发起请求，也不应该按「获取失败」来对待（不是平台或网络的问题）。
 var ErrPlatformToolsNotReady = errors.New("平台依赖的工具尚未就绪")
 
+// DeferredStreamResolver 由"每一路清晰度都要单独申请一次播放凭证"的平台实现（目前只有 Soop）。
+// 每次录制实际只用一路，而面板需要的是完整候选清单（清晰度名、分辨率、码率、选择属性），
+// 并不需要每一路的可播放地址：先只读元信息列出候选，选中之后再只解析被选中的那一路，
+// 取流请求量就不再随清晰度档数成倍增长。
+// 包装类型（WrappedLive、InitializingLive）必须显式转发这两个方法，
+// 否则类型断言走不到平台实现，录制路径会一直退回全量解析。
+type DeferredStreamResolver interface {
+	// ListStreamCandidates 列出当前可录的清晰度候选，只填元信息，Url 一律为空。
+	ListStreamCandidates() ([]*StreamUrlInfo, error)
+	// ResolveStreamCandidate 只解析传入这一路的播放地址并就地写回。
+	// 平台不支持、该档已不在候选中或凭证申请失败时返回错误，调用方应换下一档或回退 GetStreamInfos。
+	ResolveStreamCandidate(candidate *StreamUrlInfo) error
+}
+
 const (
 	// defaultInterval 没有配置轮询间隔时使用的默认值
 	defaultInterval = 30 * time.Second
@@ -333,6 +347,25 @@ func (w *WrappedLive) GetRoomID() string {
 		return provider.GetRoomID()
 	}
 	return ""
+}
+
+// ListStreamCandidates 转发给底层平台实现。包装层不实现这个方法，录制路径的类型断言
+// 就只能看到本对象，永远拿不到"只解析选中的一路"这条省请求的路径。
+func (w *WrappedLive) ListStreamCandidates() ([]*StreamUrlInfo, error) {
+	resolver, ok := w.Live.(DeferredStreamResolver)
+	if !ok {
+		return nil, ErrNotImplemented
+	}
+	return resolver.ListStreamCandidates()
+}
+
+// ResolveStreamCandidate 转发给底层平台实现。
+func (w *WrappedLive) ResolveStreamCandidate(candidate *StreamUrlInfo) error {
+	resolver, ok := w.Live.(DeferredStreamResolver)
+	if !ok {
+		return ErrNotImplemented
+	}
+	return resolver.ResolveStreamCandidate(candidate)
 }
 
 // GetCachedInfo 只读取最近一次缓存，不触发平台请求。

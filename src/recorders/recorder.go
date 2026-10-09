@@ -51,6 +51,18 @@ const (
 
 const soopRetryWarnInterval = time.Minute
 
+// fastFailThreshold 判断一次尝试是否真的拉到了流：解析持续时间短于它就按"秒退"处理。
+const fastFailThreshold = 5 * time.Second
+
+// 取流/录制连续失败时的重试间隔：
+// 本场从未录上过说明源此刻根本不可用，慢慢试（本来也没在丢内容）；
+// 已经录上过则优先保断流后的内容连续性，只稍微拉长间隔。
+const (
+	minRecordRetryInterval          = 5 * time.Second
+	maxRecordRetryIntervalNeverHeld = 60 * time.Second
+	maxRecordRetryIntervalAfterHold = 15 * time.Second
+)
+
 // for test
 var (
 	// newParser 根据配置的下载器类型创建 parser，并实现回退逻辑：
@@ -265,6 +277,41 @@ var (
 	_ danmakuRecorder = (*danmaku.DouyuDanmakuRecorder)(nil)
 )
 
+// pipelineSharedState 封装可在分段重启时共享的 Pipeline 状态
+// 分段重启时新旧 recorder 通过 redirect 链共享同一份状态，
+// 确保旧任务的回调能正确递减新 recorder 的计数器
+type pipelineSharedState struct {
+	mu             sync.Mutex
+	pendingCount   int                          // 尚未完成的 Pipeline 任务数
+	enqueued       bool                         // 是否有 Pipeline 任务已入队
+	summarySent    bool                         // 摘要是否已发送（幂等保护）
+	runExited      bool                         // run() 是否已退出（defer 中置位，回调中检查）
+	details        []notify.RecordingFileDetail // 收集的文件详情
+	sourceNames    map[string]bool              // 被 Pipeline 消费的原始文件名（用于合并时排除已删除的源文件）
+	onAllTasksDone func()                       // 所有任务完成时的回调（分段重启时设置）
+	suppressSummary bool                        // 为 true 时，run() 退出不推送摘要（分段重启场景），用 mu 保护
+	redirectedTo    atomic.Pointer[pipelineSharedState] // 分段重启时重定向到新 recorder 的共享状态
+}
+
+// resolveState 沿 redirect 链找到当前活跃的 pipelineSharedState。
+// 使用无锁遍历 + 锁内验证的方式，避免与 TransferPipelineState 产生死锁。
+// 返回时调用者持有 result.mu 锁。
+func resolveState(state *pipelineSharedState) *pipelineSharedState {
+	for {
+		// 无锁遍历找到链尾候选（通过 atomic.Load 避免与写入端的数据竞争）
+		final := state
+		for next := final.redirectedTo.Load(); next != nil; next = final.redirectedTo.Load() {
+			final = next
+		}
+		// 锁住候选状态，验证没有被并发重定向
+		final.mu.Lock()
+		if final.redirectedTo.Load() == nil {
+			return final // 调用者持有 final.mu 锁
+		}
+		final.mu.Unlock()
+	}
+}
+
 type recorder struct {
 	Live       live.Live
 	ed         events.Dispatcher
@@ -280,6 +327,25 @@ type recorder struct {
 	// 当前录制文件信息
 	currentFileLock sync.RWMutex
 	currentFilePath string
+
+	// closeForRestart 标记当前 recorder 正在分段重启，run() 退出时不发送摘要。
+	// 在 CloseForRestart 中设置（早于 Close），run() 的 defer 中检查。
+	closeForRestart atomic.Bool
+
+	// pipelineState 封装 Pipeline 相关的共享状态
+	// 使用指针，分段重启时新旧 recorder 共享同一份状态
+	pipelineState *pipelineSharedState
+
+	// transferWg 用于分段重启时的摘要屏障。
+	// RestartRecorder 在创建新 recorder 后 Add(1)，
+	// TransferPipelineState 完成后 Done()。
+	// sendAccumulatedSummary 在发送前 Wait()，确保旧分段状态已转入。
+	// 非分段重启场景为 nil，Wait 是 no-op。
+	transferWg *sync.WaitGroup
+
+	// notifyWg 跟踪异步通知 goroutine（go sendAccumulatedSummary）。
+	// 由 RecorderManager 持有，关闭流程中等待所有通知发送完成。
+	notifyWg *sync.WaitGroup
 
 	// 当前录制的流信息（来自平台 API）
 	currentStreamInfo *live.AvailableStreamInfo
@@ -300,27 +366,36 @@ type recorder struct {
 
 	// done 在 run() 退出时关闭，用于 CloseForRestart 等待 goroutine 完成
 	done chan struct{}
-	// suppressSummary 为 true 时，run() 退出不推送摘要（分段重启场景）
-	suppressSummary bool
+	// suppressSummary 已移入 pipelineSharedState，用 pipelineState.mu 保护
 
 	retryLogMu              sync.Mutex
 	lastRetryLogKey         string
 	lastRetryLogAt          time.Time
 	suppressedRetryLogCount int
+
+	// 下面三项用于连续"秒退"时逐步拉长重试间隔，避免录不了的房间不间断敲平台取流接口。
+	// consecutiveFastFailures/lastAttemptHeldStream 只被 run() 这一个 goroutine 读写
+	// （tryRecord 是它的同步调用），因此不加锁；everHeldStream 需要跨分段重启传递，用原子类型。
+	consecutiveFastFailures int
+	everHeldStream          atomic.Bool
+	lastAttemptHeldStream   bool
 }
 
 func NewRecorder(ctx context.Context, live live.Live) (Recorder, error) {
 	inst := instance.GetInstance(ctx)
 
 	return &recorder{
-		Live:       live,
-		cache:      inst.Cache,
-		startTime:  time.Now(),
-		ed:         inst.EventDispatcher.(events.Dispatcher),
-		state:      begin,
-		stop:       make(chan struct{}),
-		done:       make(chan struct{}),
-		parserLock: new(sync.RWMutex),
+		Live:            live,
+		cache:           inst.Cache,
+		startTime:       time.Now(),
+		ed:              inst.EventDispatcher.(events.Dispatcher),
+		state:           begin,
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
+		parserLock:      new(sync.RWMutex),
+		pipelineState: &pipelineSharedState{
+			sourceNames: make(map[string]bool),
+		},
 	}, nil
 }
 
@@ -328,6 +403,8 @@ func (r *recorder) tryRecord(ctx context.Context) {
 	// 每次重试前重置探测状态，避免上次录制的旧数据残留
 	// （例如上次探测成功但本次流分辨率已变化）
 	r.actualStreamInfo.Store(nil)
+	// 早退（取流失败、FFmpeg 缺失等）同样算"这次没撑住"，由 run() 拉长下次重试间隔
+	r.lastAttemptHeldStream = false
 
 	cfg := configs.GetCurrentConfig()
 
@@ -345,7 +422,11 @@ func (r *recorder) tryRecord(ctx context.Context) {
 
 	var streamInfos []*live.StreamUrlInfo
 	var err error
-	if streamInfos, err = r.Live.GetStreamInfos(); err == live.ErrNotImplemented {
+	// 本轮偏好取这一次尝试开头解析好的值，不再重读全局配置：延迟解析要跑几百毫秒的平台
+	// 请求，期间用户在面板点"切换清晰度"改的就是这个偏好，重读会让下面的最终选择与
+	// 上面的解析顺序按两套偏好算，选中根本没解析过 Url 的候选。
+	preference := resolvedConfig.StreamPreference
+	if streamInfos, err = r.getStreamInfosForRecording(preference); err == live.ErrNotImplemented {
 		var urls []*url.URL
 		// TODO: remove deprecated method GetStreamUrls
 		//nolint:staticcheck
@@ -359,13 +440,9 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		if err != nil && r.stopRetryForExplicitOffline(err) {
 			return
 		}
-		r.logStreamURLRetry(err)
-		// 使用可中断的等待，确保 Ctrl+C 能立即响应
-		select {
-		case <-ctx.Done():
-		case <-r.stop:
-		case <-time.After(5 * time.Second):
-		}
+		// 这里不再自己 sleep：重试节奏统一由 run() 的退避决定，
+		// 保留固定的 5 秒只会让人误以为下限就是 5 秒。
+		r.logStreamURLRetry(err, r.pendingRetryInterval())
 		return
 	}
 	r.resetRetryLogState()
@@ -384,15 +461,32 @@ func (r *recorder) tryRecord(ctx context.Context) {
 
 	buf := new(bytes.Buffer)
 	if err = tmpl.Execute(buf, info); err != nil {
-		r.getLogger().WithError(err).Error("failed to render filename, recording aborted")
+		// 文件名模板渲染失败通常是配置错误（如引用了不存在的字段），每次重试都会
+		// 重复失败。请求 manager 仅回收该 recorder，避免无意义的 5s 重试风暴与
+		// 日志刷屏，也不再被误计入活跃录制数；不要派发具有全局直播状态语义的
+		// LiveEnd，否则会错误地提前结束仍在进行的 live session。
+		r.getLogger().WithError(err).Error("failed to render filename, stopping recorder (check out_put_tmpl)")
+		r.ed.DispatchEvent(events.NewEvent(RecorderStopRequested, r.Live))
 		return
 	}
 	// 使用层级配置的 OutPutPath
 	fileName := filepath.Join(resolvedConfig.OutPutPath, buf.String())
 	outputPath, _ := filepath.Split(fileName)
 
-	// TODO 根据配置选择最佳流
-	streamInfo := r.selectPreferredStream(streamInfos)
+	// 按本轮固定下来的偏好选流
+	streamInfo := r.selectPreferredStream(streamInfos, preference)
+	if streamInfo == nil || streamInfo.Url == nil {
+		// 选中的这一路没有播放地址：延迟解析的列表里除被解析的那一路之外只有元信息。
+		// 走到这里说明本轮的输入已经不再自洽，绝不能继续往下解引用 Url，
+		// 也不能持着 currentFileLock 崩掉整个录制线程（状态接口的读锁会一起挂住）。
+		if streamInfo != nil {
+			err = fmt.Errorf("清晰度 %s 尚未解析出播放地址", streamInfo.Quality)
+		} else {
+			err = fmt.Errorf("没有可用的播放流")
+		}
+		r.logStreamURLRetry(err, r.pendingRetryInterval())
+		return
+	}
 	r.saveCurrentStreamInfo(streamInfo)
 	// 更新可用流信息到 info（用于API展示）
 	r.updateAvailableStreams(ctx, info, streamInfos)
@@ -584,6 +678,7 @@ func (r *recorder) tryRecord(ctx context.Context) {
 	}
 	r.setAndCloseParser(p)
 	r.startTime = time.Now()
+	parseStartedAt := r.startTime
 
 	// 弹幕录制（支持哔哩哔哩、抖音、斗鱼平台）
 	if resolvedConfig.DanmakuEnable {
@@ -634,10 +729,14 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		dmRec.Stop()
 	}
 
+	// 本次尝试是否"撑住过"由 run() 用来决定重试间隔：能持续拉流说明源可用，
+	// 连续秒退则说明源此刻录不了，应该把下一次尝试推后。
+	r.lastAttemptHeldStream = time.Since(parseStartedAt) >= fastFailThreshold
+
 	if err != nil {
 		r.getLogger().WithError(err).Error("failed to parse live stream")
 		// 视频流快速失败时（如 404），清理没有对应视频文件的残留弹幕
-		if elapsed := time.Since(r.startTime); elapsed < 5*time.Second {
+		if elapsed := time.Since(r.startTime); elapsed < fastFailThreshold {
 			cleanupOrphanedDanmakuFiles(dmFile)
 		}
 		return
@@ -786,11 +885,26 @@ func (r *recorder) tryRecord(ctx context.Context) {
 			return
 		}
 
+		// 先递增 pending 计数（在入队前，避免任务被异步调度完成后回调递减到 -1）
+		r.pipelineState.mu.Lock()
+		r.pipelineState.pendingCount++
+		r.pipelineState.mu.Unlock()
+
 		// 入队 Pipeline 任务
-		if err := pipelineManager.EnqueueRecordingTask(info, pipelineConfig, outputFiles); err != nil {
+		if err := pipelineManager.EnqueueRecordingTask(info, pipelineConfig, outputFiles, r.onPipelineTaskComplete); err != nil {
 			r.getLogger().WithError(err).Error("failed to enqueue pipeline task")
+			// 入队失败，回滚计数
+			r.pipelineState.mu.Lock()
+			r.pipelineState.pendingCount--
+			r.pipelineState.mu.Unlock()
 		} else {
-			r.getLogger().Infof("pipeline task enqueued: %d files, %d stages", len(outputFiles), len(pipelineConfig.Stages))
+			r.pipelineState.enqueued = true
+			// 记录 Pipeline 阶段顺序
+			var stageNames []string
+			for _, stage := range pipelineConfig.Stages {
+				stageNames = append(stageNames, stage.Name)
+			}
+			r.getLogger().Infof("pipeline task enqueued: %d files, stages: %v", len(outputFiles), stageNames)
 		}
 	}
 }
@@ -855,61 +969,140 @@ func (r *recorder) stopRetryForExplicitOffline(err error) bool {
 	return true
 }
 
-func (r *recorder) selectPreferredStream(streamInfos []*live.StreamUrlInfo) (ret *live.StreamUrlInfo) {
+// getStreamInfosForRecording 取得本次录制可用的流列表。
+// 平台支持"先列候选、只解析选中的那一路"时优先走那条路径：Soop 每一档清晰度都要单独申请
+// 一次播放凭证并查一次调度接口，全量解析的请求量随档位成倍增长，而每次录制实际只用一路。
+// 候选里除了被选中的一路之外只有元信息（Url 为空），面板的清晰度列表因此仍然完整。
+func (r *recorder) getStreamInfosForRecording(preference configs.StreamPreference) ([]*live.StreamUrlInfo, error) {
+	resolver, ok := r.Live.(live.DeferredStreamResolver)
+	if !ok {
+		return r.Live.GetStreamInfos()
+	}
+	candidates, err := resolver.ListStreamCandidates()
+	if err != nil {
+		if errors.Is(err, live.ErrNotImplemented) {
+			return r.Live.GetStreamInfos()
+		}
+		return nil, err
+	}
+
+	ordered := orderStreamsByPreference(candidates, preference)
+	var firstErr error
+	for i, candidate := range ordered {
+		if err := resolver.ResolveStreamCandidate(candidate); err != nil {
+			wrapped := fmt.Errorf("清晰度 %s: %w", candidate.Quality, err)
+			if errors.Is(err, live.ErrLiveOffline) {
+				// 房间在列完候选之后、解析这一档的几百毫秒里下播了：换别的档位同样取不到流，
+				// 立即上抛让 stopRetryForExplicitOffline 收手，既不重试也不再敲剩下的档位。
+				return nil, wrapped
+			}
+			if firstErr == nil {
+				firstErr = wrapped
+			}
+			r.getLogger().WithError(err).Debugf("候选清晰度 %s 取流失败，尝试下一档", candidate.Quality)
+			continue
+		}
+		// ordered[:i] 是本次尝试失败的高优先档位，与全量解析一样剔除；
+		// ordered[i+1:] 没有尝试过，保留其元信息供面板展示可选档位。
+		streams := make([]*live.StreamUrlInfo, 0, len(ordered))
+		streams = append(streams, candidate)
+		return append(streams, ordered[i+1:]...), nil
+	}
+	// 所有候选都解析失败：直接把第一路的错误上抛，由 run() 的退避拉长下一轮间隔。
+	// 不再顺手全量解析一遍——那等于在同一次尝试里把每一档的凭证与调度请求再敲一次，
+	// 而"全部失败"恰恰是最需要少发请求的状态（未登录、凭证被拒、调度异常）。
+	// 候选与平台档位对不上时会由下一轮重新列候选自愈，代价是一轮退避间隔。
+	if firstErr == nil {
+		firstErr = fmt.Errorf("soop 未返回任何可解析的清晰度")
+	}
+	return nil, firstErr
+}
+
+// orderStreamsByPreference 按偏好分值从高到低排序，分值相同保持平台返回的先后顺序，
+// 使"依次尝试"选出的第一路等于 selectPreferredStream 在全量列表上的选择结果。
+func orderStreamsByPreference(candidates []*live.StreamUrlInfo, preference configs.StreamPreference) []*live.StreamUrlInfo {
+	if preference.Quality == nil && preference.Attributes == nil {
+		return candidates
+	}
+	ordered := append([]*live.StreamUrlInfo(nil), candidates...)
+	sort.SliceStable(ordered, func(a, b int) bool {
+		return streamPreferenceScore(ordered[a], preference) > streamPreferenceScore(ordered[b], preference)
+	})
+	return ordered
+}
+
+func (r *recorder) selectPreferredStream(streamInfos []*live.StreamUrlInfo, preference configs.StreamPreference) (ret *live.StreamUrlInfo) {
 	// 如果没有可用流，直接返回 nil
 	if len(streamInfos) == 0 {
 		return nil
 	}
 
-	streamPreference := configs.GetCurrentConfig().GetEffectiveConfigForRoom(r.Live.GetRawUrl()).StreamPreference
-
 	// 如果未配置流偏好（Quality 和 Attributes 均为 nil），直接返回第一个流
-	if streamPreference.Quality == nil && streamPreference.Attributes == nil {
+	if preference.Quality == nil && preference.Attributes == nil {
 		return streamInfos[0]
 	}
 
-	// 安全获取 Quality 和 Attributes，处理 nil 情况
-	var quality string
-	if streamPreference.Quality != nil {
-		quality = *streamPreference.Quality
-	}
-	var attrs map[string]string
-	if streamPreference.Attributes != nil {
-		attrs = *streamPreference.Attributes
-	}
-
-	retMatchedCount := 0
+	bestScore := 0
 	for _, info := range streamInfos {
-		currMatchedCount := 0
-		// 仅当配置了 Quality 时才匹配
-		if quality != "" && info.Quality == quality {
-			currMatchedCount += 100
-		}
-		// 仅当配置了 Attributes 时才匹配
-		for k, v := range attrs {
-			if info.AttributesForStreamSelect[k] == v {
-				currMatchedCount += 1
-			}
-		}
-		if currMatchedCount > retMatchedCount {
+		if score := streamPreferenceScore(info, preference); score > bestScore {
 			ret = info
-			retMatchedCount = currMatchedCount
+			bestScore = score
 		}
 	}
 
 	// 如果没有任何匹配的流，回退到第一个可用流
 	if ret == nil {
-		r.getLogger().Warnf("没有流匹配配置的偏好 (quality=%s, attrs=%v)，使用第一个可用流", quality, attrs)
+		r.getLogger().Warnf("没有流匹配配置的偏好 (quality=%s, attrs=%v)，使用第一个可用流", preferenceQuality(preference), preferenceAttributes(preference))
 		return streamInfos[0]
 	}
 	return
 }
 
+// streamPreferenceScore 给一路流按偏好打分：画质名命中 +100，属性每命中一项 +1。
+// 分值相同时由调用方保持列表原有先后顺序，与"取第一个匹配项"的旧行为一致。
+func streamPreferenceScore(info *live.StreamUrlInfo, preference configs.StreamPreference) int {
+	score := 0
+	if quality := preferenceQuality(preference); quality != "" && info.Quality == quality {
+		score += 100
+	}
+	if attrs := preferenceAttributes(preference); attrs != nil {
+		for k, v := range attrs {
+			if info.AttributesForStreamSelect[k] == v {
+				score += 1
+			}
+		}
+	}
+	return score
+}
+
+func preferenceQuality(preference configs.StreamPreference) string {
+	if preference.Quality == nil {
+		return ""
+	}
+	return *preference.Quality
+}
+
+func preferenceAttributes(preference configs.StreamPreference) map[string]string {
+	if preference.Attributes == nil {
+		return nil
+	}
+	return *preference.Attributes
+}
+
 func (r *recorder) run(ctx context.Context) {
 	defer close(r.done)
-	defer r.sendAccumulatedSummary()
-
-	const minRetryInterval = 5 * time.Second
+	defer func() {
+		// 标记 run() 已退出，使回调在 remaining==0 时直接发送摘要，
+		// 而不是等待 r.done 通道关闭（避免 defer 执行顺序导致的漏发窗口）
+		r.pipelineState.mu.Lock()
+		r.pipelineState.runExited = true
+		r.pipelineState.mu.Unlock()
+		// 分段重启时跳过摘要：CloseForRestart 已设置此标记，
+		// TransferPipelineState 完成后由回调发送含完整 Pipeline 详情的摘要
+		if !r.closeForRestart.Load() {
+			r.sendAccumulatedSummary()
+		}
+	}()
 
 	for {
 		select {
@@ -923,10 +1116,11 @@ func (r *recorder) run(ctx context.Context) {
 			r.tryRecord(tryCtx)
 			tryCancel()
 
-			// 确保两次 tryRecord 之间至少间隔 minRetryInterval
-			// 防止快速失败（如 FFmpeg 秒退 404）导致紧密循环
-			if elapsed := time.Since(start); elapsed < minRetryInterval {
-				delay := minRetryInterval - elapsed
+			// 按本次尝试是否撑住过更新退避档位：
+			// 防快速失败（如 FFmpeg 秒退 404）导致紧密循环，也防录不了的房间不间断敲平台取流接口
+			retryInterval := r.noteAttemptResult(r.lastAttemptHeldStream)
+			if elapsed := time.Since(start); elapsed < retryInterval {
+				delay := retryInterval - elapsed
 				select {
 				case <-r.stop:
 					return
@@ -937,6 +1131,41 @@ func (r *recorder) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// noteAttemptResult 记录本次尝试有没有真正撑住过流，并返回下一次重试的间隔。
+// 只有 run() 这一个 goroutine 会调用，因此状态字段无需加锁。
+func (r *recorder) noteAttemptResult(heldStream bool) time.Duration {
+	if heldStream {
+		r.consecutiveFastFailures = 0
+		r.everHeldStream.Store(true)
+	} else {
+		r.consecutiveFastFailures++
+	}
+	return recordRetryInterval(r.consecutiveFastFailures, r.everHeldStream.Load())
+}
+
+// pendingRetryInterval 预测"本次尝试失败"时 run() 即将采用的间隔，仅用于日志文案。
+// 调用点在取流失败分支，此时 lastAttemptHeldStream 必为 false，
+// noteAttemptResult 会把连续失败计数加一，所以这里同样按加一后的计数计算。
+func (r *recorder) pendingRetryInterval() time.Duration {
+	return recordRetryInterval(r.consecutiveFastFailures+1, r.everHeldStream.Load())
+}
+
+// recordRetryInterval 由连续"秒退"次数推出下一次重试间隔：
+// 每失败一轮翻一倍，直到该档位的上限为止；一旦拉到过流就重新从最小间隔开始。
+func recordRetryInterval(consecutiveFastFailures int, everHeldStream bool) time.Duration {
+	maxInterval := maxRecordRetryIntervalNeverHeld
+	if everHeldStream {
+		maxInterval = maxRecordRetryIntervalAfterHold
+	}
+	// 限制位移次数，避免次数很大时溢出成负数
+	shift := min(consecutiveFastFailures-1, 4)
+	if shift < 0 {
+		shift = 0
+	}
+	interval := minRecordRetryInterval << shift
+	return min(interval, maxInterval)
 }
 
 // accumulateRecordedFiles 累积录制文件信息，仅记录实际存在的文件
@@ -956,22 +1185,41 @@ func (r *recorder) accumulateRecordedFiles(files ...string) {
 // sendAccumulatedSummary 录制结束后统一推送录制文件摘要通知
 // 在 run() 退出时通过 defer 调用，确保所有分段文件汇总为一条通知
 func (r *recorder) sendAccumulatedSummary() {
+	// 分段重启屏障：等待 TransferPipelineState 完成，
+	// 确保旧分段的 pipelineDetails/pendingCount 已转入再发送摘要
+	if r.transferWg != nil {
+		r.transferWg.Wait()
+	}
+	r.pipelineState.mu.Lock()
+	pendingCount := r.pipelineState.pendingCount
+	// 幂等保护：防止 defer 和回调并发双发
+	if r.pipelineState.summarySent {
+		r.pipelineState.mu.Unlock()
+		return
+	}
+	// Pipeline 任务尚未全部完成，等待回调触发最终摘要
+	if r.pipelineState.enqueued && pendingCount > 0 {
+		r.pipelineState.mu.Unlock()
+		r.getLogger().Infof("Pipeline 任务尚未全部完成（剩余 %d 个），延迟摘要推送", pendingCount)
+		return
+	}
+	// 标记摘要已发送（在实际发送前，防止并发双发）
+	r.pipelineState.summarySent = true
+	suppressSummary := r.pipelineState.suppressSummary
+	pipelineDetails := r.pipelineState.details
+	pipelineSourceNames := r.pipelineState.sourceNames
+	r.pipelineState.mu.Unlock()
+
 	r.recordedFilesMu.Lock()
 	defer r.recordedFilesMu.Unlock()
-	if r.suppressSummary {
+	if suppressSummary {
 		r.getLogger().Infof("录制摘要推送已抑制（分段重启），累积 %d 个文件将传递给新 recorder", len(r.recordedFiles))
 		return
 	}
-	if len(r.recordedFiles) == 0 {
+	if len(r.recordedFiles) == 0 && len(pipelineDetails) == 0 {
 		r.getLogger().Info("无录制文件，跳过摘要推送")
 		return
 	}
-	obj, err := r.cache.Get(r.Live)
-	if err != nil {
-		r.getLogger().WithError(err).Error("获取直播信息失败，无法推送录制摘要")
-		return
-	}
-	info := obj.(*live.Info)
 
 	// 获取录制输出路径，用于查询剩余磁盘空间
 	cfg := configs.GetCurrentConfig()
@@ -982,13 +1230,214 @@ func (r *recorder) sendAccumulatedSummary() {
 		outputPath = resolved.OutPutPath
 	}
 
-	r.getLogger().Infof("推送录制摘要：%d 个文件", len(r.recordedFiles))
-	notify.SendRecordingSummary(r.getLogger(), info.HostName, r.Live.GetPlatformCNName(), r.recordedFiles, outputPath)
+	// 使用 Pipeline 收集的最终文件详情（如有），否则用录制累积的原始文件
+	if len(pipelineDetails) > 0 {
+		// 合并未被 Pipeline 覆盖的录制文件（如某分段因 stages==0 未入队）
+		merged := append([]notify.RecordingFileDetail(nil), pipelineDetails...)
+		if len(r.recordedFiles) > 0 {
+			inPipeline := map[string]bool{}
+			for _, d := range pipelineDetails {
+				inPipeline[d.Name] = true
+			}
+			// 排除已被 Pipeline 转换并删除的源文件（如 convert_mp4 delete_source 场景）
+			for name := range pipelineSourceNames {
+				inPipeline[name] = true
+			}
+			for _, f := range r.recordedFiles {
+				if !inPipeline[f.Name] {
+					merged = append(merged, f)
+				}
+			}
+			// 清理无关联视频的 .ass 文件（DAA/executor 可能已删除视频但 .ass 从 recordedFiles 加入）
+			merged = filterOrphanedAssFromDetails(merged)
+		}
+		r.getLogger().Infof("推送 Pipeline 录制摘要：%d 个文件", len(merged))
+		hostName := ""
+		platform := r.Live.GetPlatformCNName()
+		if obj, cacheErr := r.cache.Get(r.Live); cacheErr == nil {
+			if info, ok := obj.(*live.Info); ok {
+				hostName = info.HostName
+			}
+		}
+		notify.SendPipelineRecordingSummary(
+			r.getLogger(),
+			hostName,
+			platform,
+			r.recordedFiles,     // originalFiles（allUploaded 时显示用）
+			merged,              // finalFiles（含未入队分段的文件）
+			outputPath,
+		)
+	} else {
+		// Pipeline 未产出有效文件详情，回退到录制累积
+		if len(r.recordedFiles) == 0 {
+			return
+		}
+		obj, err := r.cache.Get(r.Live)
+		if err != nil {
+			r.getLogger().WithError(err).Error("获取直播信息失败，无法推送录制摘要")
+			return
+		}
+		info := obj.(*live.Info)
+		r.getLogger().Infof("推送录制摘要：%d 个文件", len(r.recordedFiles))
+		notify.SendRecordingSummary(r.getLogger(), info.HostName, r.Live.GetPlatformCNName(), r.recordedFiles, outputPath)
+	}
 }
 
-func (r *recorder) logStreamURLRetry(err error) {
+// onPipelineTaskComplete Pipeline 任务完成回调
+// 由 Pipeline Manager 在 executeTask 结束时调用
+func (r *recorder) onPipelineTaskComplete(task *pipeline.PipelineTask) {
+	r.getLogger().Infof("Pipeline 回调触发：状态=%s, CurrentFiles=%d, LastStageFiles=%d, InitialFiles=%d",
+		task.Status, len(task.CurrentFiles), len(task.LastStageFiles), len(task.InitialFiles))
+	// 沿 redirect 链找到当前活跃的共享状态
+	// 支持连续重启 A→B→C 场景：A 的回调通过 resolveState 找到 C 的状态
+	ps := resolveState(r.pipelineState)
+	// ps.mu 已被 resolveState 锁住
+
+	ps.pendingCount--
+
+	// 收集任务的最终文件详情
+	switch task.Status {
+	case pipeline.PipelineStatusCompleted:
+		// 始终从 LastStageFiles 提取已上传的文件（含 Metadata["uploaded"] 标记）
+		uploadedDetails := extractUploadedDetails(task.LastStageFiles)
+		if len(uploadedDetails) > 0 {
+			ps.details = append(ps.details, uploadedDetails...)
+		}
+		// 合并本地保留的文件（CurrentFiles 中未被上传标记覆盖的文件）
+		uploadedNames := map[string]bool{}
+		for _, d := range uploadedDetails {
+			uploadedNames[d.Name] = true
+		}
+		for _, d := range pipeline.FileInfoToDetails(task.CurrentFiles) {
+			if !uploadedNames[d.Name] {
+				ps.details = append(ps.details, d)
+			}
+		}
+		// 回退：无上传标记且无保留文件时用 InitialFiles
+		if len(uploadedDetails) == 0 && len(task.CurrentFiles) == 0 {
+			for _, d := range pipeline.FileInfoToDetails(task.InitialFiles) {
+				d.Uploaded = true
+				ps.details = append(ps.details, d)
+			}
+		}
+	case pipeline.PipelineStatusFailed, pipeline.PipelineStatusCancelled:
+		// 失败/取消时优先用 CurrentFiles（最后成功阶段的输出），回退到 InitialFiles
+		if len(task.CurrentFiles) > 0 {
+			ps.details = append(ps.details, pipeline.FileInfoToDetails(task.CurrentFiles)...)
+		} else {
+			ps.details = append(ps.details, pipeline.FileInfoToDetails(task.InitialFiles)...)
+		}
+	}
+
+	// 收集被 Pipeline 转换的原始文件名（SourcePath），用于摘要合并时排除已删除的源文件
+	collectSourceNames(ps.sourceNames, task.CurrentFiles, task.LastStageFiles)
+
+	remaining := ps.pendingCount
+	runExited := ps.runExited
+	onAllDone := ps.onAllTasksDone
+
+	ps.mu.Unlock()
+
+	r.getLogger().Infof("Pipeline 任务完成（状态: %s），剩余 %d 个任务", task.Status, remaining)
+
+	// 所有任务完成且录制已结束，发送统一摘要
+	// 使用 goroutine 避免通知发送（Telegram/Email 等）阻塞 Pipeline 任务槽位
+	if remaining == 0 {
+		if onAllDone != nil {
+			// 分段重启场景：通过共享回调触发摘要（回调内部检查 runExited）
+			onAllDone()
+		} else if runExited {
+			// 非分段重启场景：run() 已退出，异步发送摘要
+			if r.notifyWg != nil {
+				r.notifyWg.Add(1)
+			}
+			go func() {
+				defer func() {
+					if r.notifyWg != nil {
+						r.notifyWg.Done()
+					}
+				}()
+				r.sendAccumulatedSummary()
+			}()
+		}
+		// run() 仍在运行且无回调：等待 run() 退出时由 defer 中的 sendAccumulatedSummary 发送
+	}
+}
+
+// extractUploadedDetails 从最后阶段输出文件中提取有上传标记的文件详情
+// CloudUploadStage 会为成功上传的文件设置 Metadata["uploaded"]=true
+// 排除封面文件（封面不在录制摘要中展示，与 FileInfoToDetails 保持一致）
+func extractUploadedDetails(files []pipeline.FileInfo) []notify.RecordingFileDetail {
+	var details []notify.RecordingFileDetail
+	for _, f := range files {
+		if f.Type == pipeline.FileTypeCover {
+			continue
+		}
+		uploaded := false
+		if f.Metadata != nil {
+			if u, ok := f.Metadata["uploaded"].(bool); ok && u {
+				uploaded = true
+			}
+		}
+		if uploaded && f.Size > 0 {
+			details = append(details, notify.RecordingFileDetail{
+				Name:     filepath.Base(f.Path),
+				Size:     f.Size,
+				Uploaded: true,
+			})
+		}
+	}
+	logrus.WithFields(logrus.Fields{
+		"input_count":    len(files),
+		"uploaded_count": len(details),
+	}).Debug("extractUploadedDetails")
+	return details
+}
+
+// collectSourceNames 从 Pipeline 输出文件中收集被转换的原始文件名
+// 当 convert_mp4/burn_subtitles 等阶段转换文件时，输出文件的 SourcePath 指向原始文件
+// 这些原始文件可能已被 Pipeline 删除，摘要合并时需要排除，避免将已删除的源文件重新纳入
+func collectSourceNames(sourceNames map[string]bool, fileSets ...[]pipeline.FileInfo) {
+	for _, files := range fileSets {
+		for _, f := range files {
+			if f.SourcePath != "" {
+				sourceNames[filepath.Base(f.SourcePath)] = true
+			}
+		}
+	}
+}
+
+// filterOrphanedAssFromDetails 从文件详情列表中移除无关联视频的 .ass 文件
+// 当 DAA/executor 删除了视频但 .ass 从 recordedFiles 加入 merged 时，
+// 需要清理这些孤立的 .ass，避免通知误显为本地保留
+func filterOrphanedAssFromDetails(details []notify.RecordingFileDetail) []notify.RecordingFileDetail {
+	videoExts := map[string]bool{".flv": true, ".mp4": true, ".mkv": true, ".ts": true}
+	videoBases := map[string]bool{}
+	for _, d := range details {
+		ext := strings.ToLower(filepath.Ext(d.Name))
+		if videoExts[ext] {
+			base := strings.TrimSuffix(d.Name, ext)
+			videoBases[base] = true
+		}
+	}
+	var result []notify.RecordingFileDetail
+	for _, d := range details {
+		ext := strings.ToLower(filepath.Ext(d.Name))
+		if ext == ".ass" {
+			base := strings.TrimSuffix(d.Name, ".ass")
+			if !videoBases[base] {
+				continue // 无关联视频，跳过
+			}
+		}
+		result = append(result, d)
+	}
+	return result
+}
+
+func (r *recorder) logStreamURLRetry(err error, nextInterval time.Duration) {
+	intervalText := nextInterval.Round(time.Second)
 	if configs.IsDebug() || !strings.EqualFold(r.Live.GetPlatformCNName(), "SOOP") {
-		r.warnStreamURLRetry(err, "failed to get stream url, will retry after 5s...", 0)
+		r.warnStreamURLRetry(err, fmt.Sprintf("failed to get stream url, will retry in %s...", intervalText), 0)
 		return
 	}
 
@@ -1005,7 +1454,7 @@ func (r *recorder) logStreamURLRetry(err error) {
 		r.lastRetryLogAt = now
 		r.suppressedRetryLogCount = 0
 		r.retryLogMu.Unlock()
-		r.warnStreamURLRetry(err, "failed to get stream url, will retry after 5s...", 0)
+		r.warnStreamURLRetry(err, fmt.Sprintf("failed to get stream url, will retry in %s...", intervalText), 0)
 		return
 	}
 
@@ -1014,7 +1463,7 @@ func (r *recorder) logStreamURLRetry(err error) {
 		r.lastRetryLogAt = now
 		r.suppressedRetryLogCount = 0
 		r.retryLogMu.Unlock()
-		r.warnStreamURLRetry(err, "failed to get stream url, still retrying every 5s...", suppressed)
+		r.warnStreamURLRetry(err, fmt.Sprintf("failed to get stream url, still retrying, current interval %s", intervalText), suppressed)
 		return
 	}
 
@@ -1118,9 +1567,12 @@ func (r *recorder) Close() {
 }
 
 func (r *recorder) CloseForRestart() []notify.RecordingFileDetail {
-	r.recordedFilesMu.Lock()
-	r.suppressSummary = true
-	r.recordedFilesMu.Unlock()
+	// 先设置重启标记，使 run() 的 defer 跳过 sendAccumulatedSummary，
+	// 避免在 TransferPipelineState 之前发送不含 Pipeline 详情的摘要
+	r.closeForRestart.Store(true)
+	r.pipelineState.mu.Lock()
+	r.pipelineState.suppressSummary = true
+	r.pipelineState.mu.Unlock()
 	r.Close()
 	<-r.done // 等待 run() 完全退出，确保最后一个文件已累积
 	r.recordedFilesMu.Lock()
@@ -1139,6 +1591,75 @@ func (r *recorder) SetInitialRecordedFiles(files []notify.RecordingFileDetail) {
 	r.recordedFilesMu.Unlock()
 	// 日志不依赖 r.recordedFiles，移到锁外减少持有时间
 	r.getLogger().Infof("继承上一个 recorder 的 %d 个录制文件", len(files))
+}
+
+// TransferPipelineState 从旧 recorder 转移 Pipeline 状态
+// 分段重启时由 RestartRecorder 调用，确保旧分段的 Pipeline 结果不丢失
+// 使用 redirect 链替代指针覆盖，支持连续重启 A→B→C 场景
+func (r *recorder) TransferPipelineState(old *recorder) {
+	// "本场录上过"是单调事实，只能由 false 变 true，所以这里做或而不是覆盖：
+	// 新 recorder 在 RestartRecorder 里先被 Start，等这里执行时它自己可能已经拉上过一次流，
+	// 无条件写入会把那份成功抹回旧实例的 false，让后续重试退回"从未录上过"的 60 秒长间隔。
+	// old 的 run() 已在 CloseForRestart 里等待退出，此处读旧值不会有并发写。
+	if old.everHeldStream.Load() {
+		r.everHeldStream.Store(true)
+	}
+
+	r.pipelineState.mu.Lock()
+	defer r.pipelineState.mu.Unlock()
+
+	// 沿 old 的 redirect 链找到最终活跃状态（可能经过多次重启 A→B→C→...）
+	oldState := resolveState(old.pipelineState)
+	// 此时 oldState.mu 已被 resolveState 锁住
+
+	// 合并 Pipeline 状态
+	r.pipelineState.enqueued = r.pipelineState.enqueued || oldState.enqueued
+	r.pipelineState.pendingCount += oldState.pendingCount
+	// 注意：suppressSummary 不合并。该标志表示"我是被重启的 recorder，不发摘要"，
+	// 新 recorder 从未调用 CloseForRestart，应保持自己的 suppressSummary=false。
+	// 回调通过 onAllTasksDone（含 runExited 检查）触发，不依赖 suppressSummary 传播。
+
+	// 合并文件详情（旧 recorder 的详情追加到新 recorder）
+	r.pipelineState.details = append(r.pipelineState.details, oldState.details...)
+
+	// 合并已被 Pipeline 消费的原始文件名
+	for name := range oldState.sourceNames {
+		r.pipelineState.sourceNames[name] = true
+	}
+
+	// 设置回调：旧任务全部完成时，触发摘要发送
+	// 回调与 suppressSummary 解耦：suppressSummary 是 recorder 级别的抑制标志，
+	// 回调是 pipeline 级别的完成通知。多跳 A→B→C 场景下，A 的回调通过 redirect
+	// 链解析到 C 的状态，如果只在 suppressSummary=true 时设置回调，B→C 转移时
+	// B.suppressSummary=false 导致 C 没有回调，A 的摘要永远发不出。
+	// runExited 检查确保只在新 recorder 已退出时发送，避免录制中提前发出摘要。
+	r.pipelineState.onAllTasksDone = func() {
+		r.pipelineState.mu.Lock()
+		shouldSend := r.pipelineState.runExited
+		r.pipelineState.mu.Unlock()
+		if shouldSend {
+			if r.notifyWg != nil {
+				r.notifyWg.Add(1)
+			}
+			go func() {
+				defer func() {
+					if r.notifyWg != nil {
+						r.notifyWg.Done()
+					}
+				}()
+				r.sendAccumulatedSummary()
+			}()
+		}
+		// run() 未退出时不发送：新 recorder 的 defer 会在退出时检查并发送
+	}
+
+	// 关键：设置 redirect 链，使旧 recorder 及更早的 recorder 的回调
+	// 能通过 resolveState 找到当前活跃的共享状态
+	oldState.redirectedTo.Store(r.pipelineState)
+	oldState.mu.Unlock()
+
+	r.getLogger().Infof("继承 Pipeline 状态：pending=%d, details=%d 个文件",
+		r.pipelineState.pendingCount, len(r.pipelineState.details))
 }
 
 func (r *recorder) getLogger() *livelogger.LiveLogger {

@@ -2,6 +2,7 @@ package sooplive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hr3lxphr6j/requests"
 	"github.com/tidwall/gjson"
@@ -30,12 +32,19 @@ const (
 	channelResultLogin = -6
 	channelResultEmpty = 0
 	channelResultBlock = -2
+
+	// 播放页与频道信息会被"监控判活"和紧随其后的"取流"连续读取，
+	// 在这个窗口内复用成功结果即可省掉重复请求。窗口必须明显小于监控轮询间隔，
+	// 否则下播感知会被缓存拖慢。
+	pageMetaReuseTTL    = 15 * time.Second
+	channelInfoReuseTTL = 15 * time.Second
 )
 
 var (
 	reWindowBroadNo    = regexp.MustCompile(`window\.nBroadNo\s*=\s*(\d+|null);`)
 	setCookiesFunc     = configs.SetCookies
 	persistCookieGroup singleflight.Group
+	streamInfoGroup    singleflight.Group
 )
 
 func init() {
@@ -55,6 +64,15 @@ type Live struct {
 	runtimeCookie      string
 	ignoreStoredCookie bool
 	stateMu            sync.RWMutex
+	// reuseMu 保护下面两个短期复用缓存，监控线程与录制线程会同时读写它们。
+	// 只缓存播放页与频道信息：aid 这类播放凭证一旦跨尝试复用，
+	// 平台拒绝旧凭证时本地无从得知，会把几秒的恢复拖成缓存窗口那么长的停录。
+	reuseMu          sync.Mutex
+	pageMetaCache    *pageMeta
+	pageMetaCachedAt time.Time
+	channelCache     *channelInfo
+	channelCacheKey  string
+	channelCachedAt  time.Time
 }
 
 func (l *Live) logRetryDetail(err error, format string, args ...interface{}) {
@@ -123,7 +141,7 @@ type viewPreset struct {
 // 2. 再尝试调用 Soop API 纠正主播名、标题和开播状态。
 func (l *Live) GetInfo() (*live.Info, error) {
 	l.GetLogger().Debugf("Soop GetInfo 开始: url=%s", l.GetRawUrl())
-	meta, err := l.fetchPageMeta()
+	meta, err := l.fetchPageMetaCached()
 	if err != nil {
 		l.GetLogger().WithError(err).Debug("Soop GetInfo 失败：页面元信息获取失败")
 		return nil, err
@@ -149,7 +167,7 @@ func (l *Live) GetInfo() (*live.Info, error) {
 	// - 登录失效
 	// - Soop API 异常
 	// - 地区 / 风控限制
-	channelInfo, err := l.resolveChannelInfo(meta.Channel, meta.BroadNo)
+	channelInfo, err := l.resolveChannelInfoCached(meta.Channel, meta.BroadNo)
 	if err != nil {
 		l.GetLogger().WithError(err).Debugf("Soop GetInfo 失败：解析频道信息失败 channel=%s broadNo=%s", meta.Channel, meta.BroadNo)
 		return nil, err
@@ -180,105 +198,33 @@ func (l *Live) GetInfo() (*live.Info, error) {
 // - 页面缺失 nBroadNo 字段但路径里带有 broadNo 时，仍会回退使用路径 broadNo 继续请求 API；
 // - 因此这里返回的“无法获取播放流”既可能表示离线，也可能表示登录态不足或页面/API 结构变化。
 func (l *Live) GetStreamInfos() ([]*live.StreamUrlInfo, error) {
+	// 录制重试、面板 /urls 与 /probe 可能在同一房间上几乎同时解析取流地址，
+	// 合并为一次实际解析，避免成倍地敲播放页、播放信息和 aid/调度接口。
+	result, err, _ := streamInfoGroup.Do(l.GetRawUrl(), func() (interface{}, error) {
+		return l.resolveStreamInfos()
+	})
+	if err != nil {
+		return nil, err
+	}
+	streams, _ := result.([]*live.StreamUrlInfo)
+	return streams, nil
+}
+
+func (l *Live) resolveStreamInfos() ([]*live.StreamUrlInfo, error) {
 	l.GetLogger().Debugf("Soop GetStreamInfos 开始: url=%s", l.GetRawUrl())
-	meta, err := l.fetchPageMeta()
+	meta, channelInfo, presets, err := l.resolveRecordingContext()
 	if err != nil {
-		l.GetLogger().WithError(err).Debug("Soop GetStreamInfos 失败：页面元信息获取失败")
 		return nil, err
 	}
-	if !meta.IsLiving {
-		l.GetLogger().Debugf("Soop GetStreamInfos 结束：页面判定无有效 broadNo channel=%s pathBroadNo=%s pageBroadNo=%s pageBroadNoFound=%v explicitOffline=%v resolvedBroadNo=%s",
-			meta.Channel, meta.PathBroadNo, meta.PageBroadNo, meta.PageBroadNoFound, meta.PageExplicitlyOffline, meta.BroadNo)
-		if meta.PageExplicitlyOffline {
-			return nil, fmt.Errorf("%w: Soop 页面已明确显示下播，当前无可录制流", live.ErrLiveOffline)
-		}
-		return nil, fmt.Errorf("未从 Soop 播放页解析到有效直播场次号，可能未开播、需要登录或页面结构已变更，暂时无法获取播放流")
-	}
 
-	channelInfo, err := l.resolveChannelInfo(meta.Channel, meta.BroadNo)
-	if err != nil {
-		l.GetLogger().WithError(err).Debugf("Soop GetStreamInfos 失败：解析频道信息失败 channel=%s broadNo=%s", meta.Channel, meta.BroadNo)
-		return nil, err
-	}
-	if channelInfo.Result != channelResultOK {
-		return nil, explainChannelResultError("Soop 播放信息接口返回异常", channelInfo.Result)
-	}
-
-	if channelInfo.BroadNo == "" || channelInfo.RMD == "" {
-		return nil, fmt.Errorf("soop 播放信息不完整：缺少 broadcast id 或调度节点地址")
-	}
-
-	headers := l.getHeadersForDownloader()
-	sortViewPresetsByPriority(channelInfo.ViewPresets)
-	streams := make([]*live.StreamUrlInfo, 0, len(channelInfo.ViewPresets))
-	for _, preset := range channelInfo.ViewPresets {
-		if strings.EqualFold(preset.Name, "auto") {
-			continue
-		}
-		l.GetLogger().Debugf("Soop 开始处理清晰度: label=%s name=%s resolution=%d bps=%d", preset.Label, preset.Name, preset.LabelResolution, preset.BPS)
-
-		aid, result, err := l.fetchAid(meta.Channel, channelInfo.BroadNo, preset.Name)
+	streams := make([]*live.StreamUrlInfo, 0, len(presets))
+	for _, preset := range presets {
+		stream, err := l.resolvePresetStream(meta.Channel, channelInfo, preset)
 		if err != nil {
-			l.logRetryDetail(err, "获取 Soop AID 失败: quality=%s", preset.Name)
+			l.logRetryDetail(err, "解析 Soop 清晰度失败: quality=%s", preset.Name)
 			continue
 		}
-		if result == channelResultLogin {
-			l.logRetryDetail(nil, "Soop AID 申请提示需要登录，准备自动重登后重试: quality=%s", preset.Name)
-			if err = l.tryAutoLogin(); err != nil {
-				l.logRetryDetail(err, "Soop 自动重登失败，无法重试 AID: quality=%s", preset.Name)
-				continue
-			}
-			aid, result, err = l.fetchAid(meta.Channel, channelInfo.BroadNo, preset.Name)
-			if err != nil {
-				l.logRetryDetail(err, "Soop 重登后再次获取 AID 失败: quality=%s", preset.Name)
-				continue
-			}
-		}
-		if result != channelResultOK || aid == "" {
-			l.logRetryDetail(nil, "Soop AID 申请失败: quality=%s, reason=%s, aid_empty=%v", preset.Name, explainChannelResult(result), aid == "")
-			continue
-		}
-		l.GetLogger().Debugf("Soop AID 申请成功: quality=%s aid_length=%d", preset.Name, len(aid))
-
-		viewURL, err := l.fetchViewURL(channelInfo.RMD, channelInfo.CDN, channelInfo.BroadNo, preset.Name)
-		if err != nil {
-			l.logRetryDetail(err, "获取 Soop 播放地址失败: quality=%s", preset.Name)
-			continue
-		}
-		l.GetLogger().Debugf("Soop 调度成功: quality=%s view_url_host=%s", preset.Name, parseHostQuiet(viewURL))
-
-		streamURL, err := appendQuery(viewURL, "aid", aid)
-		if err != nil {
-			l.logRetryDetail(err, "拼接 Soop 播放地址失败: quality=%s", preset.Name)
-			continue
-		}
-
-		u, err := url.Parse(streamURL)
-		if err != nil {
-			l.logRetryDetail(err, "解析 Soop 播放地址失败: quality=%s", preset.Name)
-			continue
-		}
-
-		qualityLabel := preset.Label
-		if qualityLabel == "" {
-			qualityLabel = preset.Name
-		}
-
-		streams = append(streams, &live.StreamUrlInfo{
-			Url:         u,
-			Name:        qualityLabel,
-			Description: qualityLabel,
-			Quality:     qualityLabel,
-			Format:      "hls",
-			Height:      preset.LabelResolution,
-			Bitrate:     preset.BPS,
-			AttributesForStreamSelect: map[string]string{
-				"format":      "hls",
-				"quality_key": preset.Name,
-			},
-			HeadersForDownloader: headers,
-		})
-		l.GetLogger().Debugf("Soop 可用流已加入: quality=%s format=hls", qualityLabel)
+		streams = append(streams, stream)
 	}
 
 	if len(streams) == 0 {
@@ -290,6 +236,171 @@ func (l *Live) GetStreamInfos() ([]*live.StreamUrlInfo, error) {
 
 	l.GetLogger().Debugf("Soop GetStreamInfos 完成：streams=%d selected_default=%s", len(streams), streams[0].Quality)
 	return streams, nil
+}
+
+// resolveRecordingContext 完成取流的前两步（播放页 + 播放信息）并校验是否可继续解析清晰度，
+// 返回按画质优先级排好序、已剔除 auto 档的候选列表。
+// 这两步的结果在 15 秒窗口内可复用，因此"先列候选、再只解析选中的一路"不会重复敲接口。
+func (l *Live) resolveRecordingContext() (*pageMeta, *channelInfo, []viewPreset, error) {
+	meta, err := l.fetchPageMetaCached()
+	if err != nil {
+		l.GetLogger().WithError(err).Debug("Soop GetStreamInfos 失败：页面元信息获取失败")
+		return nil, nil, nil, err
+	}
+	if !meta.IsLiving {
+		l.GetLogger().Debugf("Soop GetStreamInfos 结束：页面判定无有效 broadNo channel=%s pathBroadNo=%s pageBroadNo=%s pageBroadNoFound=%v explicitOffline=%v resolvedBroadNo=%s",
+			meta.Channel, meta.PathBroadNo, meta.PageBroadNo, meta.PageBroadNoFound, meta.PageExplicitlyOffline, meta.BroadNo)
+		if meta.PageExplicitlyOffline {
+			return nil, nil, nil, fmt.Errorf("%w: Soop 页面已明确显示下播，当前无可录制流", live.ErrLiveOffline)
+		}
+		return nil, nil, nil, fmt.Errorf("未从 Soop 播放页解析到有效直播场次号，可能未开播、需要登录或页面结构已变更，暂时无法获取播放流")
+	}
+
+	channelInfo, err := l.resolveChannelInfoCached(meta.Channel, meta.BroadNo)
+	if err != nil {
+		l.GetLogger().WithError(err).Debugf("Soop GetStreamInfos 失败：解析频道信息失败 channel=%s broadNo=%s", meta.Channel, meta.BroadNo)
+		return nil, nil, nil, err
+	}
+	if channelInfo.Result != channelResultOK {
+		return nil, nil, nil, explainChannelResultError("Soop 播放信息接口返回异常", channelInfo.Result)
+	}
+	if channelInfo.BroadNo == "" || channelInfo.RMD == "" {
+		return nil, nil, nil, fmt.Errorf("soop 播放信息不完整：缺少 broadcast id 或调度节点地址")
+	}
+
+	sortViewPresetsByPriority(channelInfo.ViewPresets)
+	var presets []viewPreset
+	for _, preset := range channelInfo.ViewPresets {
+		// auto 档没有固定的 Name，无法据此申请 aid，只能跳过
+		if strings.EqualFold(preset.Name, "auto") {
+			continue
+		}
+		presets = append(presets, preset)
+	}
+	return meta, channelInfo, presets, nil
+}
+
+// resolvePresetStream 为一路清晰度申请 aid 并通过调度接口拿到播放地址。
+func (l *Live) resolvePresetStream(channel string, channelInfo *channelInfo, preset viewPreset) (*live.StreamUrlInfo, error) {
+	l.GetLogger().Debugf("Soop 开始处理清晰度: label=%s name=%s resolution=%d bps=%d", preset.Label, preset.Name, preset.LabelResolution, preset.BPS)
+
+	aid, result, err := l.fetchAid(channel, channelInfo.BroadNo, preset.Name)
+	if err != nil {
+		return nil, fmt.Errorf("获取 Soop AID 失败(quality=%s): %w", preset.Name, err)
+	}
+	if result == channelResultLogin {
+		l.logRetryDetail(nil, "Soop AID 申请提示需要登录，准备自动重登后重试: quality=%s", preset.Name)
+		if err = l.tryAutoLogin(); err != nil {
+			return nil, fmt.Errorf("自动重登失败，无法重试 Soop AID(quality=%s): %w", preset.Name, err)
+		}
+		aid, result, err = l.fetchAid(channel, channelInfo.BroadNo, preset.Name)
+		if err != nil {
+			return nil, fmt.Errorf("重登后再次获取 Soop AID 失败(quality=%s): %w", preset.Name, err)
+		}
+	}
+	if result != channelResultOK || aid == "" {
+		return nil, fmt.Errorf("申请 Soop AID 失败: quality=%s, reason=%s", preset.Name, explainChannelResult(result))
+	}
+	l.GetLogger().Debugf("Soop AID 申请成功: quality=%s aid_length=%d", preset.Name, len(aid))
+
+	viewURL, err := l.fetchViewURL(channelInfo.RMD, channelInfo.CDN, channelInfo.BroadNo, preset.Name)
+	if err != nil {
+		return nil, fmt.Errorf("获取 Soop 播放地址失败(quality=%s): %w", preset.Name, err)
+	}
+	l.GetLogger().Debugf("Soop 调度成功: quality=%s view_url_host=%s", preset.Name, parseHostQuiet(viewURL))
+
+	streamURL, err := appendQuery(viewURL, "aid", aid)
+	if err != nil {
+		return nil, fmt.Errorf("拼接 Soop 播放地址失败(quality=%s): %w", preset.Name, err)
+	}
+	u, err := url.Parse(streamURL)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Soop 播放地址失败(quality=%s): %w", preset.Name, err)
+	}
+
+	stream := l.buildStreamInfo(preset)
+	stream.Url = u
+	l.GetLogger().Debugf("Soop 可用流已加入: quality=%s format=hls", stream.Quality)
+	return stream, nil
+}
+
+// buildStreamInfo 用清晰度元信息构造流条目；不带 Url 的条目只用于面板展示候选。
+func (l *Live) buildStreamInfo(preset viewPreset) *live.StreamUrlInfo {
+	qualityLabel := preset.Label
+	if qualityLabel == "" {
+		qualityLabel = preset.Name
+	}
+	return &live.StreamUrlInfo{
+		Name:        qualityLabel,
+		Description: qualityLabel,
+		Quality:     qualityLabel,
+		Format:      "hls",
+		Height:      preset.LabelResolution,
+		Bitrate:     preset.BPS,
+		AttributesForStreamSelect: map[string]string{
+			"format":      "hls",
+			"quality_key": preset.Name,
+		},
+		HeadersForDownloader: l.getHeadersForDownloader(),
+	}
+}
+
+// ListStreamCandidates 实现 live.DeferredStreamResolver：只走"播放页 + 播放信息"两步，
+// 逐档不再各自申请 aid 与调度结果。录制每次只用一路，其余档位在这里以元信息形式给出，
+// 面板的清晰度列表因此不受收窄影响。
+func (l *Live) ListStreamCandidates() ([]*live.StreamUrlInfo, error) {
+	_, _, presets, err := l.resolveRecordingContext()
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]*live.StreamUrlInfo, 0, len(presets))
+	for _, preset := range presets {
+		candidates = append(candidates, l.buildStreamInfo(preset))
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("soop 未返回任何可用清晰度")
+	}
+	l.GetLogger().Debugf("Soop 清晰度候选已列出: count=%d first=%s", len(candidates), candidates[0].Quality)
+	return candidates, nil
+}
+
+// ResolveStreamCandidate 实现 live.DeferredStreamResolver：只解析传入这一路的播放地址。
+func (l *Live) ResolveStreamCandidate(candidate *live.StreamUrlInfo) error {
+	if candidate == nil {
+		return fmt.Errorf("soop 候选清晰度为空")
+	}
+	meta, channelInfo, presets, err := l.resolveRecordingContext()
+	if err != nil {
+		return err
+	}
+	qualityKey := candidate.AttributesForStreamSelect["quality_key"]
+	for _, preset := range presets {
+		if !sameSoopPreset(preset, qualityKey, candidate.Quality) {
+			continue
+		}
+		stream, err := l.resolvePresetStream(meta.Channel, channelInfo, preset)
+		if err != nil {
+			return err
+		}
+		candidate.Url = stream.Url
+		candidate.HeadersForDownloader = stream.HeadersForDownloader
+		return nil
+	}
+	return fmt.Errorf("soop 候选清晰度 %s(quality_key=%s) 已不在当前直播的画质列表中", candidate.Quality, qualityKey)
+}
+
+// sameSoopPreset 按 quality_key 优先、清晰度标签兜底定位档位。
+// quality_key 是平台给的内部名（如 HD、SD），同一场内稳定；面板上的旧条目若已换场，
+// 两个条件都不匹配时会返回"不在列表中"错误，由调用方回退全量解析。
+func sameSoopPreset(preset viewPreset, qualityKey, qualityLabel string) bool {
+	if qualityKey != "" {
+		return strings.EqualFold(preset.Name, qualityKey)
+	}
+	label := preset.Label
+	if label == "" {
+		label = preset.Name
+	}
+	return label == qualityLabel
 }
 
 func (l *Live) GetPlatformCNName() string {
@@ -323,8 +434,12 @@ func (l *Live) fetchPageMeta() (*pageMeta, error) {
 		return nil, fmt.Errorf("请求 Soop 播放页失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// 复用的访客标识若被服务端拒绝，丢掉它让下一次退化为全新匿名访问（即持久化之前的行为），
+		// 避免一个失效的 _au 长期挡住该 host 上所有房间的请求。
+		soopVisitorCookieJar.clear(l.Url.Host)
 		return nil, fmt.Errorf("soop 播放页返回异常状态码: %d", resp.StatusCode)
 	}
+	soopVisitorCookieJar.remember(l.Url.Host, resp.Cookies())
 
 	body, err := resp.Text()
 	if err != nil {
@@ -361,6 +476,86 @@ func (l *Live) fetchPageMeta() (*pageMeta, error) {
 	l.GetLogger().Debugf("Soop 页面元信息: channel=%s pathBroadNo=%s pageBroadNo=%s pageBroadNoFound=%v explicitOffline=%v resolvedBroadNo=%s host=%s room=%s living=%v",
 		channel, pathBroadNo, pageBroadNo, pageBroadNoFound, pageExplicitlyOffline, broadNo, hostName, roomName, meta.IsLiving)
 	return meta, nil
+}
+
+// fetchPageMetaCached 在 pageMetaReuseTTL 窗口内复用"已成功且页面判定开播"的元信息。
+// 同一场直播里监控判活和紧随其后的取流会连续读播放页，复用能省掉其中一次整页下载
+// （播放页实测单页 170KB 以上，且平台没有给出任何可缓存的响应头）。
+// 明确离线、字段缺失和请求失败一律不缓存，保证下播与异常能被立刻感知。
+func (l *Live) fetchPageMetaCached() (*pageMeta, error) {
+	l.reuseMu.Lock()
+	cached := l.pageMetaCache
+	fresh := cached != nil && time.Since(l.pageMetaCachedAt) <= pageMetaReuseTTL
+	l.reuseMu.Unlock()
+	if fresh {
+		l.GetLogger().Debugf("Soop 复用播放页元信息: channel=%s broadNo=%s", cached.Channel, cached.BroadNo)
+		return cached, nil
+	}
+
+	meta, err := l.fetchPageMeta()
+	if err != nil {
+		return nil, err
+	}
+	if meta.IsLiving {
+		l.reuseMu.Lock()
+		l.pageMetaCache = meta
+		l.pageMetaCachedAt = time.Now()
+		l.reuseMu.Unlock()
+	}
+	return meta, nil
+}
+
+// resolveChannelInfoCached 在 channelInfoReuseTTL 窗口内复用 result 正常的播放信息。
+// 需要登录（-6）、已下线（0）等地区/风控异常从不缓存，仍按原逻辑重新解析。
+func (l *Live) resolveChannelInfoCached(channel, broadNo string) (*channelInfo, error) {
+	key := channelInfoKey(channel, broadNo)
+	l.reuseMu.Lock()
+	cached := l.channelCache
+	fresh := cached != nil && l.channelCacheKey == key && time.Since(l.channelCachedAt) <= channelInfoReuseTTL
+	l.reuseMu.Unlock()
+	if fresh {
+		l.GetLogger().Debugf("Soop 复用播放信息: channel=%s broadNo=%s presets=%d", channel, broadNo, len(cached.ViewPresets))
+		// 调用方会按画质优先级就地排序，返回副本避免污染缓存
+		return copyChannelInfo(cached), nil
+	}
+
+	info, err := l.resolveChannelInfo(channel, broadNo)
+	if err != nil {
+		return nil, err
+	}
+	l.reuseMu.Lock()
+	if info.Result == channelResultOK {
+		l.channelCache = info
+		l.channelCacheKey = key
+		l.channelCachedAt = time.Now()
+	} else {
+		// 状态已经转为需要登录或下线，旧的正常结果不能再复用
+		l.channelCache = nil
+		l.channelCacheKey = ""
+	}
+	l.reuseMu.Unlock()
+	// 缓存里保存原始对象，返回副本给调用方，避免就地排序污染缓存
+	return copyChannelInfo(info), nil
+}
+
+func channelInfoKey(channel, broadNo string) string {
+	return channel + "|" + broadNo
+}
+
+func copyChannelInfo(info *channelInfo) *channelInfo {
+	copied := *info
+	copied.ViewPresets = append([]viewPreset(nil), info.ViewPresets...)
+	return &copied
+}
+
+// clearReuseCache 丢弃全部短期复用结果，供登录态变化和房间配置更新时调用。
+func (l *Live) clearReuseCache() {
+	l.reuseMu.Lock()
+	defer l.reuseMu.Unlock()
+	l.pageMetaCache = nil
+	l.pageMetaCachedAt = time.Time{}
+	l.channelCache = nil
+	l.channelCacheKey = ""
 }
 
 // fetchChannelInfo 调用 player_live_api.php(type=live) 获取房间主信息。
@@ -524,10 +719,92 @@ func (l *Live) getHeadersForRequest() map[string]any {
 	return result
 }
 
+// soopVisitorCookieNames 是允许在进程内粘滞复用的访客 cookie 白名单。
+// 实测匿名请求播放页时，服务端首轮下发全新的 _au（长度 32），之后每一轮都再发一个新的；
+// 把上一轮的 _au 回传，服务端就不再下发 _au（连同 _au3rd 一起停发），说明这个访客标识是可复用的。
+// 复用它就不必每次轮询都向平台申报一个"全新访客"，减少大批量房间下的异常特征。
+// 注意生效范围：配置里带了 play 域的登录 cookie 时，服务端压根不下发 _au，这里存不下来也是空转，
+// 只有匿名录制形态（未登录或该 host 没有 cookie）才会真正复用。
+// 白名单外的名字一律不进存储：SESSION 等登录凭证必须继续走显式配置和登录流程，
+// 不能让一次普通页面响应把它们变成进程内的隐式状态。
+var soopVisitorCookieNames = []string{"_au"}
+
+// visitorCookieStore 按 host 保存进程内的访客 cookie，不落盘、不进配置、重启即失效。
+type visitorCookieStore struct {
+	mu     sync.RWMutex
+	byHost map[string]map[string]string
+}
+
+func (s *visitorCookieStore) remember(host string, cookies []*http.Cookie) {
+	if host == "" {
+		return
+	}
+	kept := make(map[string]string, len(soopVisitorCookieNames))
+	for _, cookie := range cookies {
+		if cookie == nil || !isSoopVisitorCookie(cookie.Name) {
+			continue
+		}
+		// 空值是服务端"清除该 cookie"的写法，留下只会一直发一个无效访客标识
+		if cookie.Value == "" {
+			continue
+		}
+		kept[cookie.Name] = cookie.Value
+	}
+	if len(kept) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byHost == nil {
+		s.byHost = make(map[string]map[string]string)
+	}
+	current := s.byHost[host]
+	if current == nil {
+		current = make(map[string]string, len(kept))
+		s.byHost[host] = current
+	}
+	for name, value := range kept {
+		current[name] = value
+	}
+}
+
+func (s *visitorCookieStore) get(host string) map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stored := s.byHost[host]
+	if len(stored) == 0 {
+		return nil
+	}
+	// 返回副本，调用方合并 cookie 时不会改到共享状态
+	result := make(map[string]string, len(stored))
+	for name, value := range stored {
+		result[name] = value
+	}
+	return result
+}
+
+func (s *visitorCookieStore) clear(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byHost, host)
+}
+
+func isSoopVisitorCookie(name string) bool {
+	for _, allowed := range soopVisitorCookieNames {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+var soopVisitorCookieJar visitorCookieStore
+
 // getCookieMap 将运行时 CookieJar 和配置文件中保存的 Cookie 合并成请求使用的 map。
 // 这样可以同时兼容：
 // 1. 本次运行中通过登录接口注入的 Cookie；
 // 2. 历史配置文件里持久化的 Cookie。
+// 3. 本次运行中从平台响应里收到的访客标识（_au），仅在用户没有显式给出同名 cookie 时补上。
 func (l *Live) getCookieMap() map[string]string {
 	runtimeCookie, ignoreStoredCookie := l.getRuntimeState()
 	if ignoreStoredCookie && strings.TrimSpace(runtimeCookie) == "" {
@@ -555,6 +832,12 @@ func (l *Live) getCookieMap() map[string]string {
 	}
 	if runtimeCookie != "" {
 		for name, value := range parseCookieString(runtimeCookie) {
+			cookieMap[name] = value
+		}
+	}
+	// 访客标识优先级最低：用户或登录流程给出的同名 cookie 永远赢过进程内缓存。
+	for name, value := range soopVisitorCookieJar.get(l.Url.Host) {
+		if existing, exists := cookieMap[name]; !exists || existing == "" {
 			cookieMap[name] = value
 		}
 	}
@@ -589,7 +872,7 @@ func (l *Live) resolveChannelInfo(channel, broadNo string) (*channelInfo, error)
 }
 
 // tryVerifyAndReloginIfNeeded 在真正访问 Soop 播放接口前预检查登录态。
-// 如果已有 Cookie 失效且配置中存在账号密码，则自动重新登录。
+// 如果已有 Cookie 失效且配置中存在账号密码，则自动重新登录，失败时把错误上抛。
 // 这里不会回溯重抓播放页，因此只影响后续 API 调用，不改变当前页面解析步骤的行为。
 func (l *Live) tryVerifyAndReloginIfNeeded() error {
 	cookie := l.getPrimaryCookieString()
@@ -628,14 +911,11 @@ func (l *Live) tryVerifyAndReloginIfNeeded() error {
 		l.GetLogger().Debug("Soop 普通房间将忽略已失效 Cookie，继续尝试匿名访问")
 		return nil
 	}
+	// 配了账号密码就说明这个房间需要登录态（19+ 房间匿名必定取不到流），
+	// 因此这里绝不降级匿名：把失效 Cookie 留着、把错误上抛，让外层轮询退避生效并在面板上显示失败原因。
 	l.setIgnoreStoredCookie(false)
 	l.GetLogger().Debug("Soop Cookie 无效，但已配置账号密码，准备自动登录")
-	if err := l.tryAutoLogin(); err != nil {
-		l.setRuntimeState("", true)
-		l.GetLogger().WithError(err).Warn("Soop 自动登录失败，当前运行态将忽略失效 Cookie 并降级为匿名访问")
-		return nil
-	}
-	return nil
+	return l.tryAutoLogin()
 }
 
 // tryAutoLogin 使用配置文件中的 Soop 账号密码重新换取 Cookie。
@@ -653,10 +933,17 @@ func (l *Live) tryAutoLogin() error {
 	if username == "" || password == "" {
 		return fmt.Errorf("未配置 Soop 账号密码，无法执行自动登录")
 	}
+	// 同一账号的自动登录按 autoLoginCooldown 节流，失败与"登录成功但仍判未登录"都算一次尝试。
 	l.GetLogger().Debugf("Soop 自动登录开始: username=%s", username)
 
-	result, err := loginAndGetCookieWithSingleflight(username, password)
+	result, err := autoLoginWithCooldown(username, password)
 	if err != nil {
+		// 被冷却挡住说明这一路根本没发登录请求，而同账号的别的房间可能刚刚已经换到新 Cookie
+		// 并写进了配置。先验一次配置里那份，可用就直接采用；不能因为"这个账号十分钟内登录过了"
+		// 就让这个房间继续举着自家的旧运行态干等下一个登录窗口。
+		if errors.Is(err, errAutoLoginCoolingDown) && l.adoptPersistedCookie() {
+			return nil
+		}
 		l.GetLogger().WithError(err).Debug("Soop 自动登录失败")
 		return err
 	}
@@ -673,17 +960,48 @@ func (l *Live) tryAutoLogin() error {
 	if err := persistSoopCookieWithSingleflight(result.Cookie); err != nil {
 		l.GetLogger().WithError(err).Warn("更新 Soop Cookie 到配置失败")
 	}
-	l.setRuntimeState(result.Cookie, false)
+	l.applySessionCookie(result.Cookie)
 	l.GetLogger().Debugf("Soop 自动登录成功: loginID=%s cookie_length=%d", result.Verify.LoginID, len(result.Cookie))
+
+	return nil
+}
+
+// applySessionCookie 把一份已经可用的登录 Cookie 装到当前实例：运行态、短期复用缓存与 Options。
+func (l *Live) applySessionCookie(cookie string) {
+	l.setRuntimeState(cookie, false)
+	// 换了登录身份，旧会话抓到的播放页与播放信息一律不再复用
+	l.clearReuseCache()
 
 	for _, targetURL := range []*url.URL{playSoopURL, l.Url} {
 		if targetURL == nil {
 			continue
 		}
-		live.WithKVStringCookies(targetURL, result.Cookie)(l.Options)
+		live.WithKVStringCookies(targetURL, cookie)(l.Options)
 	}
+}
 
-	return nil
+// adoptPersistedCookie 尝试采用配置里当前保存的 Cookie，成功返回 true。
+// 只在自动登录被冷却挡住时调用：本实例的运行态刚被验过一次不通过，
+// 配置里那份与它不同才值得再验一次，相同就没必要重复请求校验接口。
+func (l *Live) adoptPersistedCookie() bool {
+	cfg := configs.GetCurrentConfig()
+	if cfg == nil || cfg.Cookies == nil {
+		return false
+	}
+	candidate := strings.TrimSpace(cfg.Cookies[l.Url.Host])
+	if candidate == "" {
+		candidate = strings.TrimSpace(cfg.Cookies[domainPlaySoop])
+	}
+	if candidate == "" || candidate == strings.TrimSpace(l.getRuntimeCookie()) {
+		return false
+	}
+	result, err := verifyCookieWithCache(candidate)
+	if err != nil || result == nil || !result.IsLogin {
+		return false
+	}
+	l.applySessionCookie(candidate)
+	l.GetLogger().Infof("冷却期内直接采用配置中已刷新的 Soop Cookie: loginID=%s", result.LoginID)
+	return true
 }
 
 func persistSoopCookieWithSingleflight(cookie string) error {
@@ -751,6 +1069,8 @@ func (l *Live) setIgnoreStoredCookie(ignoreStoredCookie bool) {
 
 func (l *Live) resetRuntimeState() {
 	l.setRuntimeState("", false)
+	// 登录态或房间配置已经变化，之前复用的播放页与播放信息都可能不再成立
+	l.clearReuseCache()
 }
 
 func buildCookieStringFromCookies(cookies []*http.Cookie) string {

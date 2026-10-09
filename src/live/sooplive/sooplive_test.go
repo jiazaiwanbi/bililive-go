@@ -2,6 +2,7 @@ package sooplive
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -446,6 +447,13 @@ func TestTryVerifyAndReloginIfNeededSkipsAutoLoginWhenVerifyEndpointFails(t *tes
 	assert.Equal(t, "expired", l.getCookieMap()["SESS"])
 }
 
+// resetSoopAutoLoginCooldownForTest 清空按账号记的自动登录冷却，避免用例之间互相污染。
+func resetSoopAutoLoginCooldownForTest() {
+	autoLoginMu.Lock()
+	autoLoginAttempts = map[string]time.Time{}
+	autoLoginMu.Unlock()
+}
+
 func TestTryVerifyAndReloginIfNeededAutoLoginWhenCredentialsExist(t *testing.T) {
 	oldVerify := verifyCookieFunc
 	oldLogin := loginAndGetCookie
@@ -453,6 +461,8 @@ func TestTryVerifyAndReloginIfNeededAutoLoginWhenCredentialsExist(t *testing.T) 
 		verifyCookieFunc = oldVerify
 		loginAndGetCookie = oldLogin
 	}()
+	resetSoopAutoLoginCooldownForTest()
+	defer resetSoopAutoLoginCooldownForTest()
 
 	cfg := configs.NewConfig()
 	cfg.Cookies = map[string]string{
@@ -489,7 +499,7 @@ func TestTryVerifyAndReloginIfNeededAutoLoginWhenCredentialsExist(t *testing.T) 
 	assert.Equal(t, "fresh", l.getCookieMap()["SESS"])
 }
 
-func TestTryVerifyAndReloginIfNeededFallsBackToAnonymousWhenAutoLoginFails(t *testing.T) {
+func TestTryVerifyAndReloginIfNeededKeepsCookieAndErrorsWhenAutoLoginFails(t *testing.T) {
 	oldVerify := verifyCookieFunc
 	oldLogin := loginAndGetCookie
 	defer func() {
@@ -497,6 +507,8 @@ func TestTryVerifyAndReloginIfNeededFallsBackToAnonymousWhenAutoLoginFails(t *te
 		loginAndGetCookie = oldLogin
 	}()
 	resetVerifyCookieCacheForTest()
+	resetSoopAutoLoginCooldownForTest()
+	defer resetSoopAutoLoginCooldownForTest()
 
 	cfg := configs.NewConfig()
 	cfg.Cookies = map[string]string{
@@ -524,11 +536,276 @@ func TestTryVerifyAndReloginIfNeededFallsBackToAnonymousWhenAutoLoginFails(t *te
 	}
 	l.Options = livepkg.MustNewOptions(livepkg.WithKVStringCookies(u, "SESS=option-expired"))
 
+	// 已配凭证说明房间需要登录态（19+ 房间匿名必定取不到流）：
+	// 错误必须上抛让外层轮询退避生效，且不能把请求推成完全匿名。
 	err = l.tryVerifyAndReloginIfNeeded()
+	assert.Error(t, err)
+	assert.False(t, l.ignoreStoredCookie)
+	assert.Equal(t, "SESS=runtime-expired; AUTH=stale", l.runtimeCookie)
+	assert.Equal(t, "runtime-expired", l.getCookieMap()["SESS"])
+}
+
+func TestTryAutoLoginCooldownBlocksRepeatedAttempts(t *testing.T) {
+	oldLogin := loginAndGetCookie
+	oldSetCookies := setCookiesFunc
+	oldNow := nowFunc
+	defer func() {
+		loginAndGetCookie = oldLogin
+		setCookiesFunc = oldSetCookies
+		nowFunc = oldNow
+		resetSoopAutoLoginCooldownForTest()
+	}()
+
+	cfg := configs.NewConfig()
+	cfg.SoopLiveAuth.Username = "tester"
+	cfg.SoopLiveAuth.Password = "secret"
+	configs.SetCurrentConfig(cfg)
+	setCookiesFunc = func(hostCookies map[string]string) (*configs.Config, error) {
+		t.Fatal("登录失败时不应持久化 Cookie")
+		return nil, nil
+	}
+
+	var loginCalls int32
+	loginAndGetCookie = func(username, password string) (*LoginResult, error) {
+		atomic.AddInt32(&loginCalls, 1)
+		return nil, fmt.Errorf("soop 登录失败，平台返回业务码: -1")
+	}
+
+	now := time.Unix(1700000000, 0)
+	nowFunc = func() time.Time { return now }
+
+	u, err := url.Parse("https://play.sooplive.com/mbntv")
 	assert.NoError(t, err)
-	assert.True(t, l.ignoreStoredCookie)
-	assert.Empty(t, l.runtimeCookie)
-	assert.Empty(t, l.getCookieMap())
+	l := &Live{BaseLive: internal.NewBaseLive(u)}
+	l.Options = livepkg.MustNewOptions()
+
+	assert.Error(t, l.tryAutoLogin())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+
+	// 冷却窗口内反复轮询都不得再敲登录接口，但仍要明确报错而不是静默匿名
+	now = now.Add(time.Minute)
+	for i := 0; i < 20; i++ {
+		err = l.tryAutoLogin()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "冷却期")
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+
+	// 冷却到期后照旧重试，私有房间不会永久放弃登录
+	now = now.Add(autoLoginCooldown)
+	assert.Error(t, l.tryAutoLogin())
+	assert.Equal(t, int32(2), atomic.LoadInt32(&loginCalls))
+}
+
+func TestTryAutoLoginCooldownAppliesToSuccessfulAttempts(t *testing.T) {
+	oldLogin := loginAndGetCookie
+	oldSetCookies := setCookiesFunc
+	oldNow := nowFunc
+	defer func() {
+		loginAndGetCookie = oldLogin
+		setCookiesFunc = oldSetCookies
+		nowFunc = oldNow
+		resetSoopAutoLoginCooldownForTest()
+	}()
+
+	cfg := configs.NewConfig()
+	cfg.SoopLiveAuth.Username = "tester"
+	cfg.SoopLiveAuth.Password = "secret"
+	configs.SetCurrentConfig(cfg)
+
+	var loginCalls int32
+	var persistCalls int32
+	now := time.Unix(1700000000, 0)
+	nowFunc = func() time.Time { return now }
+	loginAndGetCookie = func(username, password string) (*LoginResult, error) {
+		atomic.AddInt32(&loginCalls, 1)
+		return &LoginResult{
+			Cookie:   "SESS=fresh; AUTH=ok",
+			Verify:   CookieVerifyResult{IsLogin: true, LoginID: username},
+			Username: username,
+		}, nil
+	}
+	setCookiesFunc = func(hostCookies map[string]string) (*configs.Config, error) {
+		atomic.AddInt32(&persistCalls, 1)
+		return configs.GetCurrentConfig(), nil
+	}
+
+	u, err := url.Parse("https://play.sooplive.com/mbntv")
+	assert.NoError(t, err)
+	l := &Live{BaseLive: internal.NewBaseLive(u)}
+	l.Options = livepkg.MustNewOptions()
+
+	assert.NoError(t, l.tryAutoLogin())
+
+	// "登录接口回成功、平台仍判未登录"是最省不了请求的一种形态：
+	// 冷却必须对成功的尝试同样生效，否则每轮都会重新登录并反复重写配置。
+	// 19 次 ×30 秒 = 9.5 分钟，仍在 10 分钟窗口内。
+	for i := 0; i < 19; i++ {
+		now = now.Add(30 * time.Second)
+		err = l.tryAutoLogin()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "冷却期")
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+	assert.Equal(t, int32(1), persistCalls)
+
+	// 冷却到期后仍会再试，不是一次性放弃
+	now = now.Add(autoLoginCooldown)
+	assert.NoError(t, l.tryAutoLogin())
+	assert.Equal(t, int32(2), atomic.LoadInt32(&loginCalls))
+}
+
+// TestTryAutoLoginAdoptsCookiePersistedByOtherRoomDuringCooldown 覆盖同账号多房间先后恢复登录态的时序：
+// 房间 A 刚换到新 Cookie 并写进配置，房间 B 下一轮轮询才被 10 分钟冷却挡住。
+// B 此时不能举着自己的旧运行态干等下一个登录窗口——19+ 私有房间匿名必定取不到流，
+// 白等一轮就是断录；配置里那份是别人刚换好的，验一次能用就直接采用。
+func TestTryAutoLoginAdoptsCookiePersistedByOtherRoomDuringCooldown(t *testing.T) {
+	oldLogin := loginAndGetCookie
+	oldSetCookies := setCookiesFunc
+	oldVerify := verifyCookieFunc
+	oldNow := nowFunc
+	defer func() {
+		loginAndGetCookie = oldLogin
+		setCookiesFunc = oldSetCookies
+		verifyCookieFunc = oldVerify
+		nowFunc = oldNow
+		resetSoopAutoLoginCooldownForTest()
+		resetVerifyCookieCacheForTest()
+	}()
+	resetSoopAutoLoginCooldownForTest()
+	resetVerifyCookieCacheForTest()
+
+	cfg := configs.NewConfig()
+	cfg.Cookies = map[string]string{domainPlaySoop: "SESS=expired"}
+	cfg.SoopLiveAuth.Username = "tester"
+	cfg.SoopLiveAuth.Password = "secret"
+	configs.SetCurrentConfig(cfg)
+
+	var loginCalls int32
+	loginAndGetCookie = func(username, password string) (*LoginResult, error) {
+		atomic.AddInt32(&loginCalls, 1)
+		return &LoginResult{
+			Cookie:   "SESS=fresh; AUTH=ok",
+			Verify:   CookieVerifyResult{IsLogin: true, LoginID: username},
+			Username: username,
+		}, nil
+	}
+	// 照真实 persist 的口径把新 Cookie 落到配置里，B 才有东西可采。
+	setCookiesFunc = func(hostCookies map[string]string) (*configs.Config, error) {
+		current := configs.GetCurrentConfig()
+		if current.Cookies == nil {
+			current.Cookies = map[string]string{}
+		}
+		for host, cookie := range hostCookies {
+			current.Cookies[host] = cookie
+		}
+		return current, nil
+	}
+	verifyCookieFunc = func(cookie string) (*CookieVerifyResult, error) {
+		if cookie == "SESS=fresh; AUTH=ok" {
+			return &CookieVerifyResult{IsLogin: true, LoginID: "tester"}, nil
+		}
+		return &CookieVerifyResult{IsLogin: false}, nil
+	}
+
+	now := time.Unix(1700000000, 0)
+	nowFunc = func() time.Time { return now }
+
+	makeLive := func() *Live {
+		u, err := url.Parse("https://play.sooplive.com/mbntv")
+		assert.NoError(t, err)
+		l := &Live{BaseLive: internal.NewBaseLive(u)}
+		l.Options = livepkg.MustNewOptions(livepkg.WithKVStringCookies(u, "SESS=expired"))
+		return l
+	}
+
+	liveA := makeLive()
+	assert.NoError(t, liveA.tryAutoLogin())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+	assert.Equal(t, "SESS=fresh; AUTH=ok", liveA.runtimeCookie)
+
+	// B 手里还是那一份刚刚被验过不通过的旧 Cookie，此刻正处在 A 占用的冷却窗口内。
+	liveB := makeLive()
+	liveB.setRuntimeState("SESS=stale", false)
+
+	assert.NoError(t, liveB.tryAutoLogin())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls), "被冷却挡住时不该再敲登录接口")
+	assert.Equal(t, "SESS=fresh; AUTH=ok", liveB.runtimeCookie)
+	assert.Equal(t, "fresh", liveB.getCookieMap()["SESS"])
+
+	// 冷却窗口过去后照旧走正常登录，采用配置 Cookie 不是一次性豁免。
+	now = now.Add(autoLoginCooldown)
+	loginAndGetCookie = func(username, password string) (*LoginResult, error) {
+		atomic.AddInt32(&loginCalls, 1)
+		return &LoginResult{
+			Cookie:   "SESS=newer; AUTH=ok",
+			Verify:   CookieVerifyResult{IsLogin: true, LoginID: username},
+			Username: username,
+		}, nil
+	}
+	assert.NoError(t, liveB.tryAutoLogin())
+	assert.Equal(t, int32(2), atomic.LoadInt32(&loginCalls))
+	assert.Equal(t, "SESS=newer; AUTH=ok", liveB.runtimeCookie)
+}
+
+// TestTryAutoLoginKeepsCooldownErrorWhenPersistedCookieAlsoInvalid 配置里那份不可用时，
+// 冷却期的原始错误必须照旧上抛：不能因为尝试过采用就把它咽掉，让外层以为这一轮登录过了。
+func TestTryAutoLoginKeepsCooldownErrorWhenPersistedCookieAlsoInvalid(t *testing.T) {
+	oldLogin := loginAndGetCookie
+	oldSetCookies := setCookiesFunc
+	oldVerify := verifyCookieFunc
+	oldNow := nowFunc
+	defer func() {
+		loginAndGetCookie = oldLogin
+		setCookiesFunc = oldSetCookies
+		verifyCookieFunc = oldVerify
+		nowFunc = oldNow
+		resetSoopAutoLoginCooldownForTest()
+		resetVerifyCookieCacheForTest()
+	}()
+	resetSoopAutoLoginCooldownForTest()
+	resetVerifyCookieCacheForTest()
+
+	cfg := configs.NewConfig()
+	cfg.Cookies = map[string]string{domainPlaySoop: "SESS=other-room-expired"}
+	cfg.SoopLiveAuth.Username = "tester"
+	cfg.SoopLiveAuth.Password = "secret"
+	configs.SetCurrentConfig(cfg)
+
+	var loginCalls int32
+	loginAndGetCookie = func(username, password string) (*LoginResult, error) {
+		atomic.AddInt32(&loginCalls, 1)
+		return &LoginResult{
+			Cookie:   "SESS=fresh; AUTH=ok",
+			Verify:   CookieVerifyResult{IsLogin: true, LoginID: username},
+			Username: username,
+		}, nil
+	}
+	setCookiesFunc = func(hostCookies map[string]string) (*configs.Config, error) {
+		return configs.GetCurrentConfig(), nil
+	}
+	verifyCookieFunc = func(cookie string) (*CookieVerifyResult, error) {
+		return &CookieVerifyResult{IsLogin: false}, nil
+	}
+
+	nowFunc = func() time.Time { return time.Unix(1700000000, 0) }
+
+	u, err := url.Parse("https://play.sooplive.com/mbntv")
+	assert.NoError(t, err)
+	l := &Live{BaseLive: internal.NewBaseLive(u)}
+	l.Options = livepkg.MustNewOptions()
+
+	// 第一次照常登录并占住冷却窗口
+	assert.NoError(t, l.tryAutoLogin())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+
+	// 第二次被冷却挡住，配置里那份也验不过，只能把冷却错误原样上抛
+	l.setRuntimeState("SESS=stale", false)
+	err = l.tryAutoLogin()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "冷却期")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&loginCalls))
+	assert.Equal(t, "SESS=stale", l.runtimeCookie, "采用失败不能顺手改掉原有运行态")
 }
 
 func TestGetCookieMapPrefersLatestConfigCookieOverStaleOptions(t *testing.T) {
@@ -706,6 +983,8 @@ func TestTryVerifyAndReloginIfNeededDeduplicatesAutoLogin(t *testing.T) {
 		verifyCookieCache = map[string]cachedVerifyResult{}
 		verifyCookieCacheMu.Unlock()
 	}()
+	resetSoopAutoLoginCooldownForTest()
+	defer resetSoopAutoLoginCooldownForTest()
 
 	verifyCookieCacheTTL = 0
 
@@ -773,6 +1052,8 @@ func TestTryAutoLoginDeduplicatesCookiePersistence(t *testing.T) {
 		loginAndGetCookie = oldLogin
 		setCookiesFunc = oldSetCookies
 	}()
+	resetSoopAutoLoginCooldownForTest()
+	defer resetSoopAutoLoginCooldownForTest()
 
 	cfg := configs.NewConfig()
 	cfg.SoopLiveAuth.Username = "tester"
@@ -833,6 +1114,8 @@ func TestTryAutoLoginRejectsUnverifiedLoginResult(t *testing.T) {
 		loginAndGetCookie = oldLogin
 		setCookiesFunc = oldSetCookies
 	}()
+	resetSoopAutoLoginCooldownForTest()
+	defer resetSoopAutoLoginCooldownForTest()
 
 	cfg := configs.NewConfig()
 	cfg.SoopLiveAuth.Username = "tester"

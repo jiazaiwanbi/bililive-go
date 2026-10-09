@@ -1,9 +1,11 @@
 package system
 
 import (
+	"context"
 	"net/url"
 	"sync"
 
+	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/live"
 	"github.com/bililive-go/bililive-go/src/live/internal"
 )
@@ -138,6 +140,30 @@ func (l *InitializingLive) GetInfo() (info *live.Info, err error) {
 	return realInfo, nil
 }
 
+// UpdateLiveOptionsbyConfig 同时更新包装对象与原始 Live 的房间选项。
+// BaseLive 是值嵌入，若只调用继承来的实现，选项（登录 cookie、只录音频、清晰度）只落在包装对象上；
+// 而初始化完成后会用 OriginalLive 顶掉本包装对象，期间热应用的 cookie 就跟着包装对象一起丢了——
+// 表现为"重新扫码后老房间仍按扫码前的登录态取流"，且没有任何提示。
+func (l *InitializingLive) UpdateLiveOptionsbyConfig(ctx context.Context, room *configs.LiveRoom) error {
+	if err := l.BaseLive.UpdateLiveOptionsbyConfig(ctx, room); err != nil {
+		return err
+	}
+	return l.OriginalLive.UpdateLiveOptionsbyConfig(ctx, room)
+}
+
+// GetRoomID 委托给原始 Live：房间号由平台实现自己解析，包装对象没有。
+// 少了这层转发，WrappedLive 的类型断言只能走到本对象就返回空，斗鱼别名 URL
+// （如 /lotterytimer）的弹幕录制会退回拿 URL 路径当房间号，弹幕登录直接失败。
+func (l *InitializingLive) GetRoomID() string {
+	type roomIDProvider interface {
+		GetRoomID() string
+	}
+	if provider, ok := l.OriginalLive.(roomIDProvider); ok {
+		return provider.GetRoomID()
+	}
+	return ""
+}
+
 func (l *InitializingLive) GetStreamUrls() (us []*url.URL, err error) {
 	// 委托给原始 Live 而不是返回空列表
 	return l.OriginalLive.GetStreamUrls() //nolint:staticcheck // deprecated 方法的委托实现
@@ -146,6 +172,22 @@ func (l *InitializingLive) GetStreamUrls() (us []*url.URL, err error) {
 func (l *InitializingLive) GetStreamInfos() ([]*live.StreamUrlInfo, error) {
 	// 委托给原始 Live
 	return l.OriginalLive.GetStreamInfos()
+}
+
+// ListStreamCandidates 委托给原始 Live；平台没有实现时返回 ErrNotImplemented，
+// 由调用方回退全量解析，不能谎报"候选为空"。
+func (l *InitializingLive) ListStreamCandidates() ([]*live.StreamUrlInfo, error) {
+	if resolver, ok := l.OriginalLive.(live.DeferredStreamResolver); ok {
+		return resolver.ListStreamCandidates()
+	}
+	return nil, live.ErrNotImplemented
+}
+
+func (l *InitializingLive) ResolveStreamCandidate(candidate *live.StreamUrlInfo) error {
+	if resolver, ok := l.OriginalLive.(live.DeferredStreamResolver); ok {
+		return resolver.ResolveStreamCandidate(candidate)
+	}
+	return live.ErrNotImplemented
 }
 
 func (l *InitializingLive) GetPlatformCNName() string {

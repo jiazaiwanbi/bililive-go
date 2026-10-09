@@ -14,12 +14,13 @@ const DEFAULT_DANMAKU: DanmakuConfig = {
   scroll_time: 10,
   resolution: '1920x1080',
   outline: 1,
-  opacity: 128,
+  opacity: 255,
   record_gift: true,
   record_douyu_gift: true,
   record_douyin_gift: true,
   record_guard: true,
   record_super_chat: true,
+  show_username: false,
   guard_position: 'bottom-left',
   sc_position: 'bottom-left',
 };
@@ -37,6 +38,7 @@ interface DanmakuConfig {
   record_douyin_gift: boolean;
   record_guard: boolean;
   record_super_chat: boolean;
+  show_username: boolean;
   guard_position: string;
   sc_position: string;
 }
@@ -200,10 +202,15 @@ const DanmakuParamForm: React.FC<{
           <InputNumber min={0} max={4} style={{ width: '100%' }} />
         </Form.Item>
         <Form.Item
-          label={<span>背景透明度 <span style={{ fontWeight: 400, fontSize: 12, color: '#999' }}>弹幕文字背景的不透明程度，0 完全透明，255 完全不透明</span></span>}
+          label={<span>文字透明度 <span style={{ fontWeight: 400, fontSize: 12, color: '#999' }}>弹幕文字本身的不透明程度，0 完全透明，255 完全不透明（仅影响滚动弹幕与礼物，SC/上舰色块不变）</span></span>}
           name={['danmaku', 'opacity']}
           rules={[{ type: 'number', min: 0, max: 255, message: '0~255' }]}>
           <InputNumber min={0} max={255} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item
+          label={<span>显示弹幕发送人 <span style={{ fontWeight: 400, fontSize: 12, color: '#999' }}>开启后 ASS 字幕与弹幕面板显示发送人昵称，关闭则不写入昵称</span></span>}
+          name={['danmaku', 'show_username']} valuePropName="checked">
+          <Switch />
         </Form.Item>
       </div>
 
@@ -569,6 +576,7 @@ const DanmakuSettings: React.FC = () => {
               label="烧录后删除 ASS 文件"
               name="burn_delete_ass"
               valuePropName="checked"
+              extra="烧录成功后标记 ASS 文件为待删除，全部处理阶段完成后才真正删除"
             >
               <Switch />
             </Form.Item>
@@ -576,7 +584,7 @@ const DanmakuSettings: React.FC = () => {
               label="烧录后删除源视频"
               name="burn_delete_source"
               valuePropName="checked"
-              extra="删除烧录前的 MP4/FLV 源文件，仅保留 MKV"
+              extra="烧录成功后标记源视频为待删除，全部处理阶段完成后才真正删除。仅保留 MKV"
             >
               <Switch />
             </Form.Item>

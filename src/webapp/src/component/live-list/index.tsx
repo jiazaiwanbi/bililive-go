@@ -1,5 +1,5 @@
 import React from "react";
-import { Button, Divider, Table, Tag, Tabs, Row, Col, Tooltip, message, List, Typography, Switch, Space, Popconfirm, Select, Spin } from 'antd';
+import { Alert, Button, Divider, Table, Tag, Tabs, Row, Col, Tooltip, message, List, Typography, Switch, Space, Popconfirm, Select, Spin } from 'antd';
 import { EditOutlined, SyncOutlined, CloudSyncOutlined, ReloadOutlined, SwapOutlined, CheckCircleOutlined, ExclamationCircleOutlined, CommentOutlined } from '@ant-design/icons';
 import PopDialog from '../pop-dialog/index';
 import BatchAddRoomDialog from '../batch-add-room-dialog/index';
@@ -317,6 +317,7 @@ interface IState {
     sortedInfo: { columnKey: string | null; order: 'ascend' | 'descend' | null }, // 表格排序状态
     danmakuMessages: { [key: string]: DanmakuMessage[] }, // roomId -> 弹幕消息列表
     expandedActiveTabs: { [key: string]: string }, // roomId -> 当前激活的 tab key
+    douyuNeedRescan: boolean, // 斗鱼 cookie 自动续期已失败，需重新扫码
 }
 
 interface ItemData {
@@ -571,7 +572,19 @@ class LiveList extends React.Component<Props, IState> {
             title: '直播平台',
             dataIndex: 'livename',
             key: 'livename',
-            render: (name: string, data: CookieItemData) => data.Platform_cn_name + '(' + data.Host + ')'
+            render: (name: string, data: CookieItemData) => {
+                const isDouyu = data.Host === 'www.douyu.com' || data.Host === 'douyu.com';
+                return (
+                    <span>
+                        {data.Platform_cn_name + '(' + data.Host + ')'}
+                        {isDouyu && this.state.douyuNeedRescan && (
+                            <Tooltip title="斗鱼登录 Cookie 自动续期已失败（长期凭证失效），录制将退回匿名录制，请点击右侧按钮重新扫码登录">
+                                <Tag color="red" style={{ marginLeft: 8 }}>需重新扫码</Tag>
+                            </Tooltip>
+                        )}
+                    </span>
+                );
+            }
         }, {
             title: 'Cookie',
             dataIndex: 'Cookie',
@@ -626,6 +639,7 @@ class LiveList extends React.Component<Props, IState> {
             sortedInfo: savedSortedInfo,
             danmakuMessages: {},
             expandedActiveTabs: {},
+            douyuNeedRescan: false,
         }
     }
 
@@ -824,10 +838,40 @@ class LiveList extends React.Component<Props, IState> {
 
             // 旧的频率限制信息处理逻辑（兼容性保留）
             const rateLimitInfo = updateData;
+            const rateLimitEnabled = rateLimitInfo?.enabled
+                ?? currentDetail?.platform_rate_limit_enabled
+                ?? true;
             const updatedDetail = {
                 ...currentDetail,
-                rate_limit_info: rateLimitInfo
+                platform_rate_limit_enabled: rateLimitEnabled,
+                platform_rate_limit: rateLimitEnabled ? currentDetail?.platform_rate_limit : 0,
+                rate_limit_info: {
+                    ...rateLimitInfo,
+                    enabled: rateLimitEnabled
+                }
             };
+
+            if (!rateLimitEnabled) {
+                return {
+                    ...prevState,
+                    expandedDetails: {
+                        ...prevState.expandedDetails,
+                        [roomId]: updatedDetail
+                    },
+                    countdownTimers: {
+                        ...prevState.countdownTimers,
+                        [roomId]: 0
+                    },
+                    lastUpdateTimes: {
+                        ...prevState.lastUpdateTimes,
+                        [roomId]: Date.now()
+                    },
+                    refreshStatus: {
+                        ...prevState.refreshStatus,
+                        [roomId]: 'idle'
+                    }
+                };
+            }
 
             const nextRequestInSec = Math.ceil(rateLimitInfo?.next_request_in_sec || 0);
             const minIntervalSec = rateLimitInfo?.min_interval_sec || currentDetail?.platform_rate_limit || 20;
@@ -1012,12 +1056,20 @@ class LiveList extends React.Component<Props, IState> {
 
     requestCookieData() {
         api.getCookieList()
-            .then(function (rsp: any) {
-                return rsp
-            }).then((data: CookieItemData[]) => {
-                this.setState({
-                    cookieList: data
-                });
+            .then((data: any) => {
+                this.setState({ cookieList: Array.isArray(data) ? data : [] });
+            })
+            .catch(err => {
+                // 与 requestListData 不同，这里原先没有 catch：网络异常时是未处理的 Promise rejection
+                console.error(`加载 Cookie 列表失败:\n${err}`);
+            })
+        // 顺带拉取斗鱼自动续期状态，续期失败时在列表上给出可见提醒
+        api.getDouyuAuthStatus()
+            .then((res: any) => {
+                this.setState({ douyuNeedRescan: !!(res && res.err_no === 0 && res.data && res.data.need_rescan) });
+            })
+            .catch(() => {
+                // 旧后端无此接口时忽略，不影响 cookie 列表本身
             })
     }
 
@@ -1193,7 +1245,7 @@ class LiveList extends React.Component<Props, IState> {
             case 'danmaku':
                 // 只在"实时弹幕"Tab 激活时累积消息
                 if (this.state.expandedActiveTabs[roomId] === 'danmaku' &&
-                    message.data && message.data.type && message.data.username && message.data.timestamp) {
+                    message.data && message.data.type && message.data.timestamp) {
                     // 写入缓冲区，不立即 setState
                     if (!this.danmakuBuffer[roomId]) {
                         this.danmakuBuffer[roomId] = [];
@@ -1235,6 +1287,9 @@ class LiveList extends React.Component<Props, IState> {
                     // 优先使用 scheduler_status 来确定刷新状态
                     const schedulerStatus = detail.scheduler_status;
                     const rateLimitInfo = detail.rate_limit_info;
+                    const rateLimitEnabled = detail.platform_rate_limit_enabled
+                        ?? rateLimitInfo?.enabled
+                        ?? true;
 
                     let initialCountdown = 0;
                     let initialStatus: RefreshStatus = 'idle';
@@ -1249,14 +1304,14 @@ class LiveList extends React.Component<Props, IState> {
                             // 有下次请求计划
                             initialCountdown = Math.ceil(schedulerStatus.seconds_until_next_request);
                             // 检查是否在等待平台限制
-                            if (rateLimitInfo?.next_request_in_sec > 0) {
+                            if (rateLimitEnabled && rateLimitInfo?.next_request_in_sec > 0) {
                                 initialStatus = 'waiting_rate_limit';
                             } else {
                                 initialStatus = 'waiting_interval';
                             }
                         } else if (schedulerStatus.seconds_until_next_request === 0) {
                             // 即将发送请求或正在等待平台限制
-                            if (rateLimitInfo?.next_request_in_sec > 0) {
+                            if (rateLimitEnabled && rateLimitInfo?.next_request_in_sec > 0) {
                                 initialCountdown = Math.ceil(rateLimitInfo.next_request_in_sec);
                                 initialStatus = 'waiting_rate_limit';
                             } else {
@@ -1270,19 +1325,24 @@ class LiveList extends React.Component<Props, IState> {
                         }
                     } else {
                         // 回退到旧逻辑（兼容性）
-                        const nextRequestInSec = Math.ceil(rateLimitInfo?.next_request_in_sec || 0);
-                        const minIntervalSec = rateLimitInfo?.min_interval_sec || detail.platform_rate_limit || 20;
-                        const waitedSec = Math.round(rateLimitInfo?.waited_seconds || 0);
-
-                        if (nextRequestInSec > 0) {
-                            initialCountdown = nextRequestInSec;
-                            initialStatus = 'waiting_rate_limit';
-                        } else if (waitedSec < minIntervalSec) {
-                            initialCountdown = minIntervalSec - waitedSec;
-                            initialStatus = 'waiting_interval';
-                        } else {
+                        if (!rateLimitEnabled) {
                             initialCountdown = 0;
                             initialStatus = 'idle';
+                        } else {
+                            const nextRequestInSec = Math.ceil(rateLimitInfo?.next_request_in_sec || 0);
+                            const minIntervalSec = rateLimitInfo?.min_interval_sec || detail.platform_rate_limit || 20;
+                            const waitedSec = Math.round(rateLimitInfo?.waited_seconds || 0);
+
+                            if (nextRequestInSec > 0) {
+                                initialCountdown = nextRequestInSec;
+                                initialStatus = 'waiting_rate_limit';
+                            } else if (waitedSec < minIntervalSec) {
+                                initialCountdown = minIntervalSec - waitedSec;
+                                initialStatus = 'waiting_interval';
+                            } else {
+                                initialCountdown = 0;
+                                initialStatus = 'idle';
+                            }
                         }
                     }
 
@@ -1428,6 +1488,9 @@ class LiveList extends React.Component<Props, IState> {
         const countdown = countdownTimers[record.roomId] ?? 0;
         const status = refreshStatus[record.roomId] ?? 'idle';
         const liveId = record.roomId;
+        const platformRateLimitEnabled = detail?.platform_rate_limit_enabled
+            ?? detail?.rate_limit_info?.enabled
+            ?? true;
         // 保存 this 引用供嵌套函数使用
         const component = this;
 
@@ -1782,7 +1845,27 @@ class LiveList extends React.Component<Props, IState> {
 
                             <Divider style={{ margin: '8px 0' }}>平台访问频率控制</Divider>
                             <div style={{ padding: '0 12px 8px' }}>
-                                {detail.rate_limit_info ? (
+                                {!platformRateLimitEnabled ? (
+                                    <div>
+                                        <Alert
+                                            message="平台级访问限流已暂时停用"
+                                            description="当前不会限制同平台请求的最小间隔或并发数；已保存的 min_access_interval_sec 配置暂不生效。"
+                                            type="warning"
+                                            showIcon
+                                        />
+                                        <div style={{ marginTop: 12, borderBottom: 'none' }}>
+                                            <Button
+                                                type="primary"
+                                                size="small"
+                                                onClick={handleForceRefresh}
+                                                loading={status === 'refreshing'}
+                                                icon={<ReloadOutlined />}
+                                            >
+                                                立即刷新
+                                            </Button>
+                                        </div>
+                                    </div>
+                                ) : detail.rate_limit_info ? (
                                     <div>
                                         <div style={configRowStyle}>
                                             <Tooltip

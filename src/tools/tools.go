@@ -903,6 +903,23 @@ func FixFlvByBililiveRecorder(ctx context.Context, fileName string) (outputFiles
 // FixFlvByBililiveRecorderWithPID 使用 BililiveRecorder 修复 FLV 文件
 // onPID 可选回调函数，在子进程启动后立即调用，传递子进程 PID
 func FixFlvByBililiveRecorderWithPID(ctx context.Context, fileName string, onPID func(pid int)) (outputFiles []string, err error) {
+	result, err := FixFlvByBililiveRecorderWithResult(ctx, fileName, onPID)
+	return result.OutputFiles, err
+}
+
+// FlvFixResult 区分实际修复和因格式不兼容而保留原文件的情况。
+type FlvFixResult struct {
+	OutputFiles []string
+	SkipReason  string
+}
+
+// FixFlvByBililiveRecorderWithResult 返回可用于任务日志的修复结果。
+func FixFlvByBililiveRecorderWithResult(ctx context.Context, fileName string, onPID func(int)) (FlvFixResult, error) {
+	files, reason, err := fixFlvByBililiveRecorder(ctx, fileName, onPID)
+	return FlvFixResult{OutputFiles: files, SkipReason: reason}, err
+}
+
+func fixFlvByBililiveRecorder(ctx context.Context, fileName string, onPID func(int)) (outputFiles []string, skipReason string, err error) {
 	defer func() {
 		if err != nil {
 			blog.GetLogger().WithError(err).Warn("failed to fix flv file by bililive-recorder")
@@ -913,6 +930,24 @@ func FixFlvByBililiveRecorderWithPID(ctx context.Context, fileName string, onPID
 
 	// 仅处理 .flv 文件，其他类型直接跳过
 	if strings.ToLower(filepath.Ext(fileName)) != ".flv" {
+		return
+	}
+
+	skipReason, err = inspectFLVForRepair(ctx, fileName)
+	if err != nil {
+		return
+	}
+	if skipReason != "" {
+		blog.GetLogger().Warnf("跳过 FLV 修复，保留原文件 %s：%s", fileName, skipReason)
+		return
+	}
+
+	// 同一实例只允许一个修复进程，避免多个大文件同时占满内存。
+	select {
+	case flvRepairSlot <- struct{}{}:
+		defer func() { <-flvRepairSlot }()
+	case <-ctx.Done():
+		err = ctx.Err()
 		return
 	}
 
@@ -936,6 +971,7 @@ func FixFlvByBililiveRecorderWithPID(ctx context.Context, fileName string, onPID
 		return
 	}
 	if !bililiveRecorder.DoesToolExist() {
+		err = errors.New("bililive-recorder tool not exist")
 		return
 	}
 
@@ -952,33 +988,16 @@ func FixFlvByBililiveRecorderWithPID(ctx context.Context, fileName string, onPID
 		return
 	}
 
-	// 使用 cmd.Start() 非阻塞启动，以便获取 PID
-	stdout, pipeErr := cmd.StdoutPipe()
-	if pipeErr != nil {
-		err = fmt.Errorf("failed to create stdout pipe: %w", pipeErr)
+	// 异常退出时仅清理本次产生的分段，原文件和已有分段均保留。
+	previousParts, partsErr := flvRepairParts(fileName)
+	if partsErr != nil {
+		err = partsErr
 		return
 	}
-
-	if err = cmd.Start(); err != nil {
-		return
-	}
-
-	// 回调通知调用方子进程 PID
-	if onPID != nil && cmd.Process != nil {
-		onPID(cmd.Process.Pid)
-	}
-
-	// 读取 stdout
-	out, readErr := io.ReadAll(stdout)
-	if readErr != nil {
-		// 仍需等待进程结束
-		cmd.Wait()
-		err = fmt.Errorf("failed to read stdout: %w", readErr)
-		return
-	}
-
-	// 等待进程结束
-	if err = cmd.Wait(); err != nil {
+	out, runErr := runFLVRepair(ctx, cmd, onPID, flvRepairRSS)
+	if runErr != nil {
+		cleanupNewFLVRepairParts(fileName, previousParts)
+		err = runErr
 		return
 	}
 
